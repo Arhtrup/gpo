@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+rasterio
+numpy
+Pillow
+python-multipart
+aiofiles
