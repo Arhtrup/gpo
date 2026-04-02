@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.templating import Jinja2Templates
 import os
 from datetime import datetime
 import json
@@ -8,41 +9,68 @@ import rasterio
 import io
 import database
 import tile_utils
-from settings import IMAGES_DIR
+from settings import (
+    IMAGES_DIR, PRODUCT_SUBDIRS, DB_INIT_TABLE, WEB_TITLE,
+    COLOR_BACKGROUND, COLOR_CONTROLS_BG, COLOR_BUTTON, COLOR_BUTTON_HOVER,
+    COLOR_SELECT_BG, COLOR_SELECT_HOVER, COLOR_TEXT_LIGHT,
+    MAP_HEIGHT, MAP_HEIGHT_MOBILE, CONTROLS_PADDING,
+    DEFAULT_OPACITY, DEFAULT_MAP_ZOOM, DEFAULT_MAP_CENTER, MAX_ZOOM_TILES,
+    HOST, PORT, ENABLE_COMPARE
+)
 from models import SatelliteImageInfo
 
-database.init_db()
+# Инициализация базы данных
+if DB_INIT_TABLE:
+    database.init_db()
 
+def parse_filename(filename):
+    """Парсит имя файла: ожидается tile_id_YYYYMMDDThhmmss.ext"""
+    base = os.path.splitext(filename)[0]
+    parts = base.split('_')
+    if len(parts) >= 3:
+        tile_id = parts[0]
+        datetime_str = parts[1]
+        try:
+            dt = datetime.strptime(datetime_str.split('T')[0], "%Y%m%d").date()
+            return tile_id, dt
+        except Exception:
+            return None
+    return None
+
+# Заполнение базы данных GeoTIFF-файлами из подпапок
 if not database.get_all_dates():
-    for fname in os.listdir(IMAGES_DIR):
-        if fname.endswith(".jpg"):
-            parts = fname.replace(".jpg", "").split("_")
-            if len(parts) == 3:
-                tile_id, datetime_str, layer = parts
-                date_str = datetime_str.split("T")[0]
-                try:
-                    dt = datetime.strptime(date_str, "%Y%m%d").date()
-                except:
+    for product_type in PRODUCT_SUBDIRS:
+        product_dir = os.path.join(IMAGES_DIR, product_type)
+        if not os.path.isdir(product_dir):
+            continue
+        for fname in os.listdir(product_dir):
+            if fname.lower().endswith(('.tiff', '.tif', '.jpg', '.jpeg')):
+                parsed = parse_filename(fname)
+                if parsed is None:
+                    print(f"Skipping {fname}: cannot parse")
                     continue
-                filepath = os.path.join(IMAGES_DIR, fname)
+                tile_id, dt = parsed
+                filepath = os.path.join(product_dir, fname)
                 try:
                     with rasterio.open(filepath) as src:
-                        bounds = src.bounds 
+                        bounds = src.bounds
                 except Exception as e:
-                    print(f"Warning: Could not read georeferencing for {fname}: {e}")
+                    print(f"Warning: Could not read georeferencing for {filepath}: {e}")
                     bounds = (-180, -90, 180, 90)
-                
+
+                rel_path = os.path.join(product_type, fname)
                 info = SatelliteImageInfo(
-                    filename=fname,
+                    filename=rel_path,
                     date=dt,
-                    layer_type=layer,
+                    layer_type=product_type,
                     bounds=bounds,
                     tile_id=tile_id
                 )
                 database.add_image(info)
-                print(f"Added {fname} to database.")
+                print(f"Added {rel_path} to database.")
 
-app = FastAPI(title="Satellite Image Server")
+app = FastAPI(title=WEB_TITLE)
+templates = Jinja2Templates(directory="templates")
 
 app.add_middleware(
     CORSMiddleware,
@@ -80,243 +108,60 @@ async def tile(date: str, layer: str, z: int, x: int, y: int):
 
     return StreamingResponse(tile_data, media_type="image/png")
 
+@app.get("/api/statistics/{date}/{layer}")
+async def get_layer_statistics(date: str, layer: str):
+    """Статистика по слою для указанной даты"""
+    img_info = database.get_image_by_layer_and_date(date, layer)
+    if not img_info:
+        raise HTTPException(status_code=404, detail="Layer not found")
+    filepath = os.path.join(IMAGES_DIR, img_info["filename"])
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File not found")
+    stats = tile_utils.get_statistics(filepath)
+    if stats is None:
+        raise HTTPException(status_code=500, detail="Could not read statistics")
+    return stats
+
+@app.post("/api/compare")
+async def compare_layers(request: dict):
+    """Сравнение двух слоёв (дата1/слой1 и дата2/слой2)"""
+    date1 = request.get("date1")
+    layer1 = request.get("layer1")
+    date2 = request.get("date2")
+    layer2 = request.get("layer2")
+    if not date1 or not layer1 or not date2 or not layer2:
+        raise HTTPException(status_code=400, detail="Missing parameters")
+    # Получаем статистику для обоих слоёв
+    stats1 = await get_layer_statistics(date1, layer1)
+    stats2 = await get_layer_statistics(date2, layer2)
+    return {
+        "layer1": {"date": date1, "layer": layer1, "statistics": stats1},
+        "layer2": {"date": date2, "layer": layer2, "statistics": stats2}
+    }
+
 @app.get("/", response_class=HTMLResponse)
-async def get_map():
-    """HTML-страница с картой и UI для выбора дат и типа отображения"""
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Satellite Viewer</title>
-        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-        <style>
-            body { margin:0; padding:0; font-family: Arial, sans-serif; }
-            #map { height:100vh; width:100vw; }
-            #controls {
-                position: absolute;
-                top: 20px;
-                right: 20px;
-                z-index: 1000;
-                background: white;
-                padding: 15px;
-                border-radius: 8px;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-                min-width: 200px;
-            }
-            .control-group {
-                margin-bottom: 15px;
-            }
-            .control-group label {
-                display: block;
-                margin-bottom: 5px;
-                font-weight: bold;
-                color: #333;
-            }
-            select {
-                width: 100%;
-                padding: 8px;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-                font-size: 14px;
-            }
-            .layer-item {
-                display: flex;
-                align-items: center;
-                margin-bottom: 8px;
-                padding: 5px;
-                background: #f5f5f5;
-                border-radius: 4px;
-            }
-            .layer-item input[type="checkbox"] {
-                margin-right: 8px;
-            }
-            .layer-item label {
-                margin: 0;
-                font-weight: normal;
-                cursor: pointer;
-                flex-grow: 1;
-            }
-            .layer-item input[type="range"] {
-                width: 60px;
-                margin-left: 5px;
-            }
-            .opacity-value {
-                font-size: 12px;
-                color: #666;
-                margin-left: 5px;
-                min-width: 35px;
-            }
-            h3 {
-                margin: 0 0 10px 0;
-                color: #333;
-                font-size: 16px;
-            }
-            .date-selector {
-                margin-bottom: 15px;
-            }
-        </style>
-    </head>
-    <body>
-        <div id="map"></div>
-        <div id="controls">
-            <h3>Управление слоями</h3>
-            <div class="control-group">
-                <label for="dateSelect">Дата:</label>
-                <select id="dateSelect" onchange="onDateChange()">
-                    <option value="">Загрузка...</option>
-                </select>
-            </div>
-            <div id="layersContainer">
-                <p>Выберите дату для загрузки слоёв</p>
-            </div>
-        </div>
-
-        <script>
-            const map = L.map('map').setView([55.75, 37.62], 10);
-            
-            L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                attribution: '© OpenStreetMap'
-            }).addTo(map);
-
-            // Хранилище для активных слоёв
-            const activeLayers = {};
-
-            // Загрузка доступных дат
-            fetch('/api/dates')
-                .then(r => r.json())
-                .then(dates => {
-                    const select = document.getElementById('dateSelect');
-                    select.innerHTML = '';
-                    
-                    if (dates.length === 0) {
-                        select.innerHTML = '<option value="">Нет доступных дат</option>';
-                        return;
-                    }
-                    
-                    dates.forEach(date => {
-                        const option = document.createElement('option');
-                        option.value = date;
-                        option.textContent = date;
-                        select.appendChild(option);
-                    });
-                    
-                    // Загружаем слои для первой даты
-                    if (dates.length > 0) {
-                        loadLayersForDate(dates[0]);
-                    }
-                });
-
-            function onDateChange() {
-                const date = document.getElementById('dateSelect').value;
-                if (date) {
-                    loadLayersForDate(date);
-                }
-            }
-
-            function loadLayersForDate(date) {
-                fetch(`/api/layers/${date}`)
-                    .then(r => r.json())
-                    .then(layers => {
-                        const container = document.getElementById('layersContainer');
-                        
-                        if (layers.length === 0) {
-                            container.innerHTML = '<p>Нет слоёв для выбранной даты</p>';
-                            return;
-                        }
-                        
-                        let html = '<div class="control-group"><label>Доступные слои:</label>';
-                        
-                        layers.forEach(layer => {
-                            const layerId = `layer_${date}_${layer.layer}`;
-                            const isActive = activeLayers[layerId] ? true : false;
-                            
-                            html += `
-                                <div class="layer-item">
-                                    <input type="checkbox" 
-                                           id="${layerId}" 
-                                           ${isActive ? 'checked' : ''} 
-                                           onchange="toggleLayer('${date}', '${layer.layer}', this.checked)">
-                                    <label for="${layerId}">${layer.layer}</label>
-                                    <input type="range" 
-                                           id="opacity_${layerId}" 
-                                           min="0" 
-                                           max="1" 
-                                           step="0.1" 
-                                           value="${activeLayers[layerId]?.opacity || 0.7}"
-                                           onchange="updateOpacity('${date}', '${layer.layer}', this.value)"
-                                           oninput="updateOpacityLabel('${layerId}', this.value)">
-                                    <span class="opacity-value" id="opacityVal_${layerId}">${activeLayers[layerId]?.opacity || 0.7}</span>
-                                </div>
-                            `;
-                        });
-                        
-                        html += '</div>';
-                        container.innerHTML = html;
-                        
-                        // Автоматически включаем слои, которые были активны
-                        layers.forEach(layer => {
-                            const layerId = `layer_${date}_${layer.layer}`;
-                            if (activeLayers[layerId]) {
-                                addLayerToMap(date, layer.layer, activeLayers[layerId].opacity);
-                            }
-                        });
-                    });
-            }
-
-            function toggleLayer(date, layerType, isChecked) {
-                const layerId = `layer_${date}_${layerType}`;
-                
-                if (isChecked) {
-                    const opacityInput = document.getElementById(`opacity_${layerId}`);
-                    const opacity = opacityInput ? parseFloat(opacityInput.value) : 0.7;
-                    addLayerToMap(date, layerType, opacity);
-                } else {
-                    if (activeLayers[layerId]) {
-                        map.removeLayer(activeLayers[layerId].layer);
-                        delete activeLayers[layerId];
-                    }
-                }
-            }
-
-            function addLayerToMap(date, layerType, opacity) {
-                const layerId = `layer_${date}_${layerType}`;
-                
-                // Удаляем существующий слой если есть
-                if (activeLayers[layerId]) {
-                    map.removeLayer(activeLayers[layerId].layer);
-                }
-                
-                // Создаём новый слой
-                const tileLayer = L.tileLayer(`/tiles/${date}/${layerType}/{z}/{x}/{y}.png`, {
-                    attribution: 'Satellite',
-                    opacity: opacity
-                }).addTo(map);
-                
-                activeLayers[layerId] = {
-                    layer: tileLayer,
-                    opacity: opacity
-                };
-            }
-
-            function updateOpacity(date, layerType, value) {
-                const layerId = `layer_${date}_${layerType}`;
-                const opacity = parseFloat(value);
-                
-                if (activeLayers[layerId]) {
-                    activeLayers[layerId].layer.setOpacity(opacity);
-                    activeLayers[layerId].opacity = opacity;
-                }
-            }
-
-            function updateOpacityLabel(layerId, value) {
-                document.getElementById(`opacityVal_${layerId}`).textContent = parseFloat(value).toFixed(1);
-            }
-        </script>
-    </body>
-    </html>
-    """
+async def get_map(request: Request):
+    """Страница с картой и панелью управления + панель сравнения"""
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "web_title": WEB_TITLE,
+        "color_background": COLOR_BACKGROUND,
+        "color_controls_bg": COLOR_CONTROLS_BG,
+        "color_button": COLOR_BUTTON,
+        "color_button_hover": COLOR_BUTTON_HOVER,
+        "color_select_bg": COLOR_SELECT_BG,
+        "color_select_hover": COLOR_SELECT_HOVER,
+        "color_text_light": COLOR_TEXT_LIGHT,
+        "map_height": MAP_HEIGHT,
+        "map_height_mobile": MAP_HEIGHT_MOBILE,
+        "controls_padding": CONTROLS_PADDING,
+        "default_opacity": DEFAULT_OPACITY,
+        "default_map_zoom": DEFAULT_MAP_ZOOM,
+        "default_map_center": DEFAULT_MAP_CENTER,
+        "max_zoom_tiles": MAX_ZOOM_TILES,
+        "enable_compare": ENABLE_COMPARE
+    })
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=HOST, port=PORT)
