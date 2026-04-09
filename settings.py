@@ -1,17 +1,13 @@
 import os
-# ПУТИ К ФАЙЛАМ
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-IMAGES_DIR = os.path.join(BASE_DIR, "images")
+IMAGES_DIR = os.path.join(BASE_DIR, "tiff")
 DATABASE_PATH = os.path.join(BASE_DIR, "satellite.db")
 
-# Подпапки с продуктами (TCI, NDVI, NDWI)
 PRODUCT_SUBDIRS = ['TCI', 'NDVI', 'NDWI']
 
-# ПАРАМЕТРЫ ВЕБ-ИНТЕРФЕЙСА
 WEB_TITLE = "Спутниковый просмотрщик"
 WEB_DESCRIPTION = "Просмотр спутниковых снимков в реальном времени"
 
-# Цвета и стили
 COLOR_BACKGROUND = "linear-gradient(135deg, #1e3c72 0%, #2a5298 100%)"
 COLOR_CONTROLS_BG = "rgba(0,0,0,0.7)"
 COLOR_BUTTON = "#4caf50"
@@ -20,12 +16,10 @@ COLOR_SELECT_BG = "rgba(255,255,255,0.9)"
 COLOR_SELECT_HOVER = "#fff"
 COLOR_TEXT_LIGHT = "#fff"
 
-# Размеры
 MAP_HEIGHT = "600px"
 MAP_HEIGHT_MOBILE = "400px"
 CONTROLS_PADDING = "15px 20px"
 
-# Прочие параметры
 DEFAULT_OPACITY = 70  # процент
 DEFAULT_MAP_ZOOM = 2
 DEFAULT_MAP_CENTER = [0, 0]

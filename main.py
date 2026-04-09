@@ -9,6 +9,7 @@ import rasterio
 import io
 import database
 import tile_utils
+from geotiff_parser import parse_geotiff_metadata
 from settings import (
     IMAGES_DIR, PRODUCT_SUBDIRS, DB_INIT_TABLE, WEB_TITLE,
     COLOR_BACKGROUND, COLOR_CONTROLS_BG, COLOR_BUTTON, COLOR_BUTTON_HOVER,
@@ -19,10 +20,42 @@ from settings import (
 )
 from models import SatelliteImageInfo
 
-# Инициализация базы данных
+# ------------------- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ И МИГРАЦИЯ -------------------
 if DB_INIT_TABLE:
-    database.init_db()
+    database.init_db()   # создаёт таблицу и добавляет недостающие колонки
 
+def migrate_existing_records():
+    """Обновляет старые записи, у которых отсутствуют метаданные (crs, width и т.д.)"""
+    conn = sqlite3.connect(database.DATABASE_PATH)
+    c = conn.cursor()
+    # Выбираем записи, где хотя бы одно из новых полей NULL
+    c.execute("SELECT filename FROM images WHERE crs IS NULL OR width IS NULL OR height IS NULL")
+    rows = c.fetchall()
+    for (filename,) in rows:
+        filepath = os.path.join(IMAGES_DIR, filename)
+        if not os.path.exists(filepath):
+            continue
+        try:
+            meta = parse_geotiff_metadata(filepath)
+            c.execute("""
+                UPDATE images 
+                SET crs = ?, width = ?, height = ?, 
+                    min_value = ?, max_value = ?, mean_value = ?, stddev = ?
+                WHERE filename = ?
+            """, (meta['crs'], meta['width'], meta['height'],
+                  meta['min_value'], meta['max_value'], meta['mean_value'], meta['stddev'],
+                  filename))
+        except Exception as e:
+            print(f"Migration error for {filename}: {e}")
+    conn.commit()
+    conn.close()
+    print(f"Migrated {len(rows)} records with missing metadata.")
+
+# Запускаем миграцию, если в БД уже есть записи
+if database.get_all_dates():
+    migrate_existing_records()
+
+# ------------------- ЗАПОЛНЕНИЕ БАЗЫ НОВЫМИ ФАЙЛАМИ -------------------
 def parse_filename(filename):
     """Парсит имя файла: ожидается tile_id_YYYYMMDDThhmmss.ext"""
     base = os.path.splitext(filename)[0]
@@ -37,38 +70,59 @@ def parse_filename(filename):
             return None
     return None
 
-# Заполнение базы данных GeoTIFF-файлами из подпапок
+# Если база пуста – заполняем из файлов
 if not database.get_all_dates():
     for product_type in PRODUCT_SUBDIRS:
         product_dir = os.path.join(IMAGES_DIR, product_type)
         if not os.path.isdir(product_dir):
             continue
         for fname in os.listdir(product_dir):
-            if fname.lower().endswith(('.tiff', '.tif', '.jpg', '.jpeg')):
+            if fname.lower().endswith(('.tiff', '.tif')):
                 parsed = parse_filename(fname)
                 if parsed is None:
-                    print(f"Skipping {fname}: cannot parse")
+                    print(f"Skipping {fname}: cannot parse filename")
                     continue
                 tile_id, dt = parsed
                 filepath = os.path.join(product_dir, fname)
                 try:
+                    meta = parse_geotiff_metadata(filepath)
+                except Exception as e:
+                    print(f"Warning: Could not read GeoTIFF metadata for {filepath}: {e}")
+                    # fallback: минимальные данные
                     with rasterio.open(filepath) as src:
                         bounds = src.bounds
-                except Exception as e:
-                    print(f"Warning: Could not read georeferencing for {filepath}: {e}")
-                    bounds = (-180, -90, 180, 90)
+                        crs = src.crs.to_string() if src.crs else None
+                        width, height = src.width, src.height
+                    meta = {
+                        'bounds': bounds,
+                        'crs': crs,
+                        'width': width,
+                        'height': height,
+                        'min_value': None,
+                        'max_value': None,
+                        'mean_value': None,
+                        'stddev': None
+                    }
 
                 rel_path = os.path.join(product_type, fname)
                 info = SatelliteImageInfo(
                     filename=rel_path,
                     date=dt,
                     layer_type=product_type,
-                    bounds=bounds,
-                    tile_id=tile_id
+                    bounds=meta['bounds'],
+                    tile_id=tile_id,
+                    crs=meta['crs'],
+                    width=meta['width'],
+                    height=meta['height'],
+                    min_value=meta['min_value'],
+                    max_value=meta['max_value'],
+                    mean_value=meta['mean_value'],
+                    stddev=meta['stddev']
                 )
                 database.add_image(info)
                 print(f"Added {rel_path} to database.")
 
+# ------------------- FASTAPI ПРИЛОЖЕНИЕ -------------------
 app = FastAPI(title=WEB_TITLE)
 templates = Jinja2Templates(directory="templates")
 
@@ -131,7 +185,6 @@ async def compare_layers(request: dict):
     layer2 = request.get("layer2")
     if not date1 or not layer1 or not date2 or not layer2:
         raise HTTPException(status_code=400, detail="Missing parameters")
-    # Получаем статистику для обоих слоёв
     stats1 = await get_layer_statistics(date1, layer1)
     stats2 = await get_layer_statistics(date2, layer2)
     return {
