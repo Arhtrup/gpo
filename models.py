@@ -5,13 +5,14 @@ from typing import Optional, Tuple
 class SatelliteImageInfo(BaseModel):
     filename: str
     date: date
-    layer_type: str          # TCI, NDVI, NDWI
-    bounds: Tuple[float, float, float, float]  # (minx, miny, maxx, maxy)
+    layer_type: str
+    bounds: Tuple[float, float, float, float]
+    bounds_wgs84: Optional[Tuple[float, float, float, float]] = None
     tile_id: str
-    crs: Optional[str] = None          # строка EPSG или WKT
-    width: Optional[int] = None        # ширина в пикселях
-    height: Optional[int] = None       # высота в пикселях
-    min_value: Optional[float] = None  # статистика минимума
-    max_value: Optional[float] = None  # статистика максимума
-    mean_value: Optional[float] = None # среднее
-    stddev: Optional[float] = None     # стандартное отклонение
+    crs: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+    mean_value: Optional[float] = None
+    stddev: Optional[float] = None

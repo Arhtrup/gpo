@@ -12,14 +12,12 @@
             padding: 0;
             box-sizing: border-box;
         }
-
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: {{ color_background }};
             min-height: 100vh;
             padding: 20px;
         }
-
         .container {
             max-width: 1400px;
             margin: 0 auto;
@@ -29,7 +27,6 @@
             box-shadow: 0 8px 32px rgba(0,0,0,0.2);
             overflow: hidden;
         }
-
         .controls {
             padding: {{ controls_padding }};
             background: {{ color_controls_bg }};
@@ -39,42 +36,35 @@
             align-items: flex-end;
             border-bottom: 1px solid rgba(255,255,255,0.2);
         }
-
         .compare-panel {
             padding: 15px 20px;
             background: rgba(0,0,0,0.5);
             border-bottom: 1px solid rgba(255,255,255,0.2);
             color: {{ color_text_light }};
         }
-
         .compare-panel h3 {
             margin-bottom: 10px;
             font-size: 1.1rem;
         }
-
         .compare-group {
             display: flex;
             flex-direction: column;
             gap: 5px;
         }
-
         .compare-group label {
             font-size: 0.85rem;
         }
-
         .control-group {
             display: flex;
             flex-direction: column;
             gap: 5px;
         }
-
         .control-group label {
             color: {{ color_text_light }};
             font-size: 0.85rem;
             letter-spacing: 0.5px;
             font-weight: 500;
         }
-
         select, input[type="range"] {
             background: {{ color_select_bg }};
             border: none;
@@ -84,22 +74,18 @@
             cursor: pointer;
             transition: all 0.2s ease;
         }
-
         select:hover, input[type="range"]:hover {
             background: {{ color_select_hover }};
             transform: scale(1.02);
         }
-
         select {
             min-width: 150px;
         }
-
         .opacity-value {
             color: {{ color_text_light }};
             font-size: 0.8rem;
             margin-left: 8px;
         }
-
         button {
             background: {{ color_button }};
             color: white;
@@ -110,16 +96,13 @@
             font-weight: bold;
             transition: background 0.2s;
         }
-
         button:hover {
             background: {{ color_button_hover }};
             transform: scale(1.02);
         }
-
         .map-wrapper {
             padding: 20px;
         }
-
         #map {
             height: {{ map_height }};
             border-radius: 12px;
@@ -127,7 +110,6 @@
             border: 2px solid rgba(255,255,255,0.2);
             background: #111;
         }
-
         .loading {
             color: {{ color_text_light }};
             text-align: center;
@@ -137,7 +119,6 @@
             border-radius: 8px;
             margin-top: 10px;
         }
-
         table {
             width: 100%;
             border-collapse: collapse;
@@ -152,7 +133,6 @@
             font-weight: bold;
             background: rgba(0,0,0,0.3);
         }
-
         @media (max-width: 768px) {
             .controls {
                 flex-direction: column;
@@ -174,19 +154,19 @@
     <div class="container">
         <div class="controls">
             <div class="control-group">
-                <label>📅 Дата</label>
+                <label>Дата</label>
                 <select id="date-select">
                     <option value="">Загрузка дат...</option>
                 </select>
             </div>
             <div class="control-group">
-                <label>🛰️ Слой</label>
+                <label>Слой</label>
                 <select id="layer-select" disabled>
                     <option value="">Сначала выберите дату</option>
                 </select>
             </div>
             <div class="control-group">
-                <label>🎨 Прозрачность</label>
+                <label>Прозрачность</label>
                 <div style="display: flex; align-items: center; gap: 8px;">
                     <input type="range" id="opacity-slider" min="0" max="100" value="{{ default_opacity }}" step="1" style="width: 120px;">
                     <span id="opacity-value" class="opacity-value">{{ default_opacity }}%</span>
@@ -199,7 +179,7 @@
 
         {% if enable_compare %}
         <div class="compare-panel">
-            <h3>📊 Сравнение слоёв</h3>
+            <h3>Сравнение слоёв</h3>
             <div style="display: flex; gap: 20px; flex-wrap: wrap;">
                 <div class="compare-group">
                     <label>Дата 1:</label>
@@ -241,9 +221,9 @@
 
     <script>
         const map = L.map('map').setView({{ default_map_center }}, {{ default_map_zoom }});
-        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            attribution: '© OpenStreetMap contributors',
-            maxZoom: 19
+        L.tileLayer('{{ base_tile_url }}', {
+            attribution: '{{ base_attribution }}',
+            maxZoom: {{ base_max_zoom }}
         }).addTo(map);
 
         let currentLayer = null;
@@ -257,7 +237,6 @@
         const applyBtn = document.getElementById('apply-btn');
         const loadingDiv = document.getElementById('loading-message');
 
-        // Элементы сравнения (могут отсутствовать, если функция отключена)
         const compareDate1 = document.getElementById('compare-date1');
         const compareDate2 = document.getElementById('compare-date2');
         const compareLayer1 = document.getElementById('compare-layer1');
@@ -337,12 +316,19 @@
                     const option = document.createElement('option');
                     option.value = layer.layer;
                     option.textContent = layer.layer;
+                    // bounds приходят в формате [minLng, minLat, maxLng, maxLat]
+                    option.dataset.bounds = JSON.stringify(layer.bounds);
                     targetSelect.appendChild(option);
                 });
                 if (layers.length > 0 && targetSelect === layerSelect && !isCompare) {
                     targetSelect.value = layers[0].layer;
                     currentLayerType = layers[0].layer;
                     updateMapLayer();
+                    const bounds = layers[0].bounds;
+                    if (bounds && bounds.length === 4) {
+                        // Leaflet ожидает [[southWestLat, southWestLng], [northEastLat, northEastLng]]
+                        map.fitBounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]]);
+                    }
                 }
             }
         }
@@ -434,6 +420,13 @@
         });
 
         layerSelect.addEventListener('change', (e) => {
+            const selectedOption = e.target.options[e.target.selectedIndex];
+            if (selectedOption && selectedOption.dataset.bounds) {
+                const bounds = JSON.parse(selectedOption.dataset.bounds);
+                if (bounds && bounds.length === 4) {
+                    map.fitBounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]]);
+                }
+            }
             if (e.target.value) {
                 updateMapLayer();
             }
