@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from datetime import date
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 class SatelliteImageInfo(BaseModel):
     filename: str
@@ -16,3 +16,4 @@ class SatelliteImageInfo(BaseModel):
     max_value: Optional[float] = None
     mean_value: Optional[float] = None
     stddev: Optional[float] = None
+    histogram: Optional[List[int]] = None

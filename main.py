@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
@@ -7,107 +7,64 @@ import sqlite3
 from datetime import datetime
 import json
 import rasterio
-from rasterio.warp import transform_bounds
-import io
+from rasterio.warp import transform_bounds, reproject, Resampling
+import numpy as np
 from PIL import Image
+import io
 import database
-import tile_utils
-from geotiff_parser import parse_geotiff_metadata
+from geotiff_parser import parse_geotiff_metadata, guess_crs_from_filename
 from logger import app_logger
 from settings import (
     IMAGES_DIR, PRODUCT_SUBDIRS, DB_INIT_TABLE, WEB_TITLE,
     COLOR_BACKGROUND, COLOR_CONTROLS_BG, COLOR_BUTTON, COLOR_BUTTON_HOVER,
     COLOR_SELECT_BG, COLOR_SELECT_HOVER, COLOR_TEXT_LIGHT,
     MAP_HEIGHT, MAP_HEIGHT_MOBILE, CONTROLS_PADDING,
-    DEFAULT_OPACITY, DEFAULT_MAP_ZOOM, DEFAULT_MAP_CENTER, MAX_ZOOM_TILES,
-    HOST, PORT, ENABLE_COMPARE,
+    DEFAULT_OPACITY, DEFAULT_MAP_ZOOM, DEFAULT_MAP_CENTER,
+    HOST, PORT, ENABLE_COMPARE, COMPARE_SHOW_HISTOGRAMS, COMPARE_HISTOGRAM_BINS,
     DEFAULT_BASE_TILE_URL, DEFAULT_BASE_ATTRIBUTION, DEFAULT_BASE_MAX_ZOOM,
-    TEMPLATES_DIR, CORS_ALLOW_ORIGINS, CORS_ALLOW_METHODS, CORS_ALLOW_HEADERS
+    TEMPLATES_DIR, CORS_ALLOW_ORIGINS, CORS_ALLOW_METHODS, CORS_ALLOW_HEADERS,
+    LAYER_LABELS, MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT, IMAGE_QUALITY
 )
 from models import SatelliteImageInfo
 
-app_logger.info("Запуск спутникового просмотрщика")
+app_logger.info("Запуск спутникового просмотрщика (режим полного изображения)")
 
 if DB_INIT_TABLE:
     database.init_db()
-    app_logger.debug("База данных проинициализирована")
 
-# ========== МИГРАЦИИ ==========
-def migrate_existing_records():
+def migrate_crs():
     conn = sqlite3.connect(database.DATABASE_PATH)
     c = conn.cursor()
-    # Добавляем колонку bounds_wgs84, если её нет
-    c.execute("PRAGMA table_info(images)")
-    cols = [row[1] for row in c.fetchall()]
-    if 'bounds_wgs84' not in cols:
-        c.execute("ALTER TABLE images ADD COLUMN bounds_wgs84 TEXT")
-        conn.commit()
-        app_logger.info("Добавлена колонка bounds_wgs84")
-
-    c.execute("SELECT filename, bounds, crs FROM images WHERE bounds_wgs84 IS NULL")
+    c.execute("SELECT filename, crs FROM images WHERE crs IS NULL")
     rows = c.fetchall()
-    app_logger.info(f"Найдено {len(rows)} записей для миграции bounds_wgs84")
-    for filename, bounds_json, crs_str in rows:
-        filepath = os.path.join(IMAGES_DIR, filename)
-        if not os.path.exists(filepath):
-            app_logger.warning(f"Файл не найден: {filepath}")
-            continue
-        try:
-            with rasterio.open(filepath) as src:
-                bounds = json.loads(bounds_json)
-                if src.crs:
-                    bounds_wgs84 = transform_bounds(src.crs, 'EPSG:4326', *bounds)
-                else:
-                    # Если CRS нет в файле, пробуем определить по имени (для Sentinel-2)
-                    if 'T45VUC' in filename:
-                        crs = "EPSG:32645"
-                        bounds_wgs84 = transform_bounds(crs, 'EPSG:4326', *bounds)
-                    else:
-                        app_logger.warning(f"Невозможно определить CRS для {filename}, bounds_wgs84 не обновлён")
-                        continue
-                c.execute("UPDATE images SET bounds_wgs84 = ?, crs = ? WHERE filename = ?",
-                          (json.dumps(bounds_wgs84), src.crs.to_string() if src.crs else crs, filename))
-                app_logger.debug(f"Миграция {filename}: {bounds_wgs84}")
-        except Exception as e:
-            app_logger.error(f"Ошибка миграции {filename}: {e}")
+    updated = 0
+    for filename, _ in rows:
+        guessed = guess_crs_from_filename(filename)
+        if guessed:
+            c.execute("UPDATE images SET crs = ? WHERE filename = ?", (guessed, filename))
+            updated += 1
+            app_logger.info(f"Обновлён CRS для {filename} -> {guessed}")
     conn.commit()
     conn.close()
-    app_logger.info("Миграция bounds_wgs84 завершена")
+    app_logger.info(f"Миграция CRS завершена, обновлено записей: {updated}")
 
-def migrate_metadata():
-    conn = sqlite3.connect(database.DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("SELECT filename FROM images WHERE crs IS NULL OR width IS NULL")
-    rows = c.fetchall()
-    app_logger.info(f"Найдено {len(rows)} записей для миграции метаданных")
-    for (filename,) in rows:
-        filepath = os.path.join(IMAGES_DIR, filename)
-        if not os.path.exists(filepath):
-            continue
-        try:
-            meta = parse_geotiff_metadata(filepath)
-            c.execute("""
-                UPDATE images 
-                SET crs = ?, width = ?, height = ?, 
-                    min_value = ?, max_value = ?, mean_value = ?, stddev = ?,
-                    bounds_wgs84 = ?
-                WHERE filename = ?
-            """, (meta['crs'], meta['width'], meta['height'],
-                  meta['min_value'], meta['max_value'], meta['mean_value'], meta['stddev'],
-                  json.dumps(meta['bounds_wgs84']), filename))
-        except Exception as e:
-            app_logger.error(f"Ошибка миграции {filename}: {e}")
-    conn.commit()
-    conn.close()
+migrate_crs()
 
-if database.get_all_dates():
-    app_logger.info("Обнаружены существующие записи, запускаем миграции")
-    migrate_existing_records()
-    migrate_metadata()
-else:
-    app_logger.info("База данных пуста, будет выполнено сканирование файлов")
+def compute_histogram(filepath: str, bins=50) -> list:
+    try:
+        with rasterio.open(filepath) as src:
+            data = src.read(1)
+            if src.nodata is not None:
+                data = data[data != src.nodata]
+            data = data[~np.isnan(data)]
+            if data.size == 0:
+                return []
+            hist, _ = np.histogram(data, bins=bins)
+            return hist.tolist()
+    except Exception as e:
+        app_logger.error(f"Ошибка вычисления гистограммы для {filepath}: {e}")
+        return []
 
-# ========== СКАНИРОВАНИЕ ФАЙЛОВ (без изменений) ==========
 def parse_filename(filename):
     base = os.path.splitext(filename)[0]
     parts = base.split('_')
@@ -140,29 +97,10 @@ if not database.get_all_dates():
             filepath = os.path.join(product_dir, fname)
             try:
                 meta = parse_geotiff_metadata(filepath)
+                histogram = compute_histogram(filepath, COMPARE_HISTOGRAM_BINS) if COMPARE_SHOW_HISTOGRAMS else None
             except Exception as e:
                 app_logger.error(f"Ошибка чтения метаданных {filepath}: {e}")
-                # fallback: минимальные данные
-                try:
-                    with rasterio.open(filepath) as src:
-                        bounds = src.bounds
-                        crs = src.crs.to_string() if src.crs else None
-                        width, height = src.width, src.height
-                        bounds_wgs84 = transform_bounds(src.crs, 'EPSG:4326', *bounds) if src.crs else bounds
-                    meta = {
-                        'bounds': bounds,
-                        'bounds_wgs84': bounds_wgs84,
-                        'crs': crs,
-                        'width': width,
-                        'height': height,
-                        'min_value': None,
-                        'max_value': None,
-                        'mean_value': None,
-                        'stddev': None
-                    }
-                except Exception as e2:
-                    app_logger.error(f"Не удалось открыть {filepath}: {e2}")
-                    continue
+                continue
 
             rel_path = os.path.join(product_type, fname)
             info = SatelliteImageInfo(
@@ -178,13 +116,13 @@ if not database.get_all_dates():
                 min_value=meta['min_value'],
                 max_value=meta['max_value'],
                 mean_value=meta['mean_value'],
-                stddev=meta['stddev']
+                stddev=meta['stddev'],
+                histogram=histogram
             )
             database.add_image(info)
-            app_logger.info(f"Добавлено в БД: {rel_path} (bounds_wgs84={meta['bounds_wgs84']})")
+            app_logger.info(f"Добавлено в БД: {rel_path}")
     app_logger.info("Сканирование завершено")
 
-# ========== FASTAPI APP ==========
 app = FastAPI(title=WEB_TITLE)
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
@@ -197,30 +135,71 @@ app.add_middleware(
 
 @app.get("/api/dates", response_model=list[str])
 async def get_dates():
-    dates = database.get_all_dates()
-    return dates
+    return database.get_all_dates()
 
 @app.get("/api/layers/{date}")
 async def get_layers(date: str):
     layers = database.get_layers_for_date(date)
-    app_logger.debug(f"Слои для {date}: {layers}")
+    for l in layers:
+        l["label"] = LAYER_LABELS.get(l["layer"], l["layer"])
     return layers
 
-@app.get("/tiles/{date}/{layer}/{z}/{x}/{y}.png")
-async def tile(date: str, layer: str, z: int, x: int, y: int):
-    img_info = database.get_image_by_layer_and_date(date, layer)
+@app.get("/api/image/{date}/{layer}")
+async def get_full_image(date: str, layer: str):
+    """Возвращает полноразмерное изображение (PNG) после ресемплинга до разумных размеров"""
+    img_info = database.get_image_info_by_layer_and_date(date, layer)
     if not img_info:
         raise HTTPException(status_code=404, detail="Layer not found")
-    tile_data = await tile_utils.get_tile(img_info["filename"], z, x, y)
-    if tile_data is None:
-        empty = Image.new('RGBA', (256, 256), (0, 0, 0, 0))
-        img_bytes = io.BytesIO()
-        empty.save(img_bytes, format='PNG')
-        img_bytes.seek(0)
-        return StreamingResponse(img_bytes, media_type="image/png")
-    return StreamingResponse(tile_data, media_type="image/png")
+    if not img_info.get("crs"):
+        raise HTTPException(status_code=400, detail="CRS not defined for this layer")
+    
+    filepath = os.path.join(IMAGES_DIR, img_info["filename"])
+    try:
+        with rasterio.open(filepath) as src:
+            # Читаем все каналы (1 или 3)
+            if src.count == 1:
+                data = src.read(1)
+                # Нормализация
+                if src.nodata is not None:
+                    data = np.where(data == src.nodata, np.nan, data)
+                data = np.nan_to_num(data, nan=0.0)
+                if data.max() - data.min() > 1e-6:
+                    data = ((data - data.min()) / (data.max() - data.min()) * 255).astype(np.uint8)
+                else:
+                    data = np.zeros_like(data, dtype=np.uint8)
+                img = Image.fromarray(data, mode='L').convert('RGB')
+            elif src.count >= 3:
+                data = src.read([1, 2, 3])
+                data = data.astype(np.float32)
+                if src.nodata is not None:
+                    data = np.where(data == src.nodata, np.nan, data)
+                data = np.nan_to_num(data, nan=0.0)
+                dmin, dmax = data.min(), data.max()
+                if dmax - dmin > 1e-6:
+                    data = (data - dmin) / (dmax - dmin) * 255
+                else:
+                    data = np.zeros_like(data)
+                data = data.astype(np.uint8)
+                data = np.moveaxis(data, 0, -1)  # (H, W, 3)
+                img = Image.fromarray(data, mode='RGB')
+            else:
+                raise HTTPException(status_code=500, detail="Unsupported band count")
+            
+            # Ресемплинг, если изображение слишком большое
+            if img.width > MAX_IMAGE_WIDTH or img.height > MAX_IMAGE_HEIGHT:
+                ratio = min(MAX_IMAGE_WIDTH / img.width, MAX_IMAGE_HEIGHT / img.height)
+                new_size = (int(img.width * ratio), int(img.height * ratio))
+                img = img.resize(new_size, Image.Resampling.BILINEAR)
+            
+            # Сохраняем в PNG (прозрачность не нужна)
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format='PNG')
+            img_bytes.seek(0)
+            return StreamingResponse(img_bytes, media_type="image/png")
+    except Exception as e:
+        app_logger.error(f"Ошибка генерации изображения для {filepath}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ИСПРАВЛЕННЫЙ ЭНДПОИНТ СТАТИСТИКИ – читает из БД
 @app.get("/api/statistics/{date}/{layer}")
 async def get_layer_statistics(date: str, layer: str):
     stats = database.get_statistics_for_layer(date, layer)
@@ -239,8 +218,8 @@ async def compare_layers(request: dict):
     stats1 = await get_layer_statistics(date1, layer1)
     stats2 = await get_layer_statistics(date2, layer2)
     return {
-        "layer1": {"date": date1, "layer": layer1, "statistics": stats1},
-        "layer2": {"date": date2, "layer": layer2, "statistics": stats2}
+        "layer1": {"date": date1, "layer": layer1, "statistics": stats1, "label": LAYER_LABELS.get(layer1, layer1)},
+        "layer2": {"date": date2, "layer": layer2, "statistics": stats2, "label": LAYER_LABELS.get(layer2, layer2)}
     }
 
 @app.get("/", response_class=HTMLResponse)
@@ -258,14 +237,15 @@ async def get_map(request: Request):
         "map_height": MAP_HEIGHT,
         "map_height_mobile": MAP_HEIGHT_MOBILE,
         "controls_padding": CONTROLS_PADDING,
-        "default_opacity": DEFAULT_OPACITY,
+        "default_opacity": DEFAULT_OPACITY / 100.0,
         "default_map_zoom": DEFAULT_MAP_ZOOM,
         "default_map_center": DEFAULT_MAP_CENTER,
-        "max_zoom_tiles": MAX_ZOOM_TILES,
         "enable_compare": ENABLE_COMPARE,
-        "base_tile_url": DEFAULT_BASE_TILE_URL,
-        "base_attribution": DEFAULT_BASE_ATTRIBUTION,
-        "base_max_zoom": DEFAULT_BASE_MAX_ZOOM
+        "show_histograms": COMPARE_SHOW_HISTOGRAMS,
+        "default_base_tile_url": DEFAULT_BASE_TILE_URL,
+        "default_base_attribution": DEFAULT_BASE_ATTRIBUTION,
+        "default_base_max_zoom": DEFAULT_BASE_MAX_ZOOM,
+        "layer_labels": LAYER_LABELS
     })
 
 if __name__ == "__main__":

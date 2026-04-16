@@ -6,12 +6,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: {{ color_background }};
@@ -23,7 +20,7 @@
             margin: 0 auto;
             background: rgba(255,255,255,0.1);
             border-radius: 20px;
-            backdrop-filter: blur(2px);
+            backdrop-filter: blur(10px);
             box-shadow: 0 8px 32px rgba(0,0,0,0.2);
             overflow: hidden;
         }
@@ -34,427 +31,266 @@
             flex-wrap: wrap;
             gap: 15px;
             align-items: flex-end;
-            border-bottom: 1px solid rgba(255,255,255,0.2);
+            border-bottom: 1px solid rgba(255,255,255,0.1);
         }
-        .compare-panel {
-            padding: 15px 20px;
-            background: rgba(0,0,0,0.5);
-            border-bottom: 1px solid rgba(255,255,255,0.2);
-            color: {{ color_text_light }};
-        }
-        .compare-panel h3 {
-            margin-bottom: 10px;
-            font-size: 1.1rem;
-        }
-        .compare-group {
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-        }
-        .compare-group label {
-            font-size: 0.85rem;
-        }
-        .control-group {
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-        }
-        .control-group label {
-            color: {{ color_text_light }};
-            font-size: 0.85rem;
-            letter-spacing: 0.5px;
-            font-weight: 500;
-        }
-        select, input[type="range"] {
-            background: {{ color_select_bg }};
-            border: none;
-            border-radius: 8px;
-            padding: 8px 12px;
-            font-size: 0.9rem;
-            cursor: pointer;
-            transition: all 0.2s ease;
-        }
-        select:hover, input[type="range"]:hover {
-            background: {{ color_select_hover }};
-            transform: scale(1.02);
-        }
+        .control-group { display: flex; flex-direction: column; gap: 8px; }
+        label { color: {{ color_text_light }}; font-size: 0.9rem; font-weight: 500; }
         select {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: none;
+            background: {{ color_select_bg }};
             min-width: 150px;
-        }
-        .opacity-value {
-            color: {{ color_text_light }};
-            font-size: 0.8rem;
-            margin-left: 8px;
+            cursor: pointer;
         }
         button {
+            padding: 8px 20px;
+            border-radius: 8px;
+            border: none;
             background: {{ color_button }};
             color: white;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 8px;
+            font-weight: 600;
             cursor: pointer;
-            font-weight: bold;
-            transition: background 0.2s;
+            transition: background 0.3s;
         }
-        button:hover {
-            background: {{ color_button_hover }};
-            transform: scale(1.02);
-        }
-        .map-wrapper {
+        button:hover { background: {{ color_button_hover }}; }
+        #map { height: {{ map_height }}; width: 100%; background: #111; }
+        
+        .stats-panel {
             padding: 20px;
+            color: white;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
         }
-        #map {
-            height: {{ map_height }};
+        .stats-card {
+            background: rgba(255,255,255,0.05);
+            padding: 15px;
             border-radius: 12px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
-            border: 2px solid rgba(255,255,255,0.2);
-            background: #111;
         }
-        .loading {
-            color: {{ color_text_light }};
-            text-align: center;
-            padding: 10px;
-            font-size: 0.9rem;
-            background: rgba(0,0,0,0.6);
+        .loader {
+            display: none;
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0,0,0,0.8);
+            color: white;
+            padding: 10px 20px;
             border-radius: 8px;
-            margin-top: 10px;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 10px;
-        }
-        th, td {
-            padding: 8px;
-            text-align: left;
-            border-bottom: 1px solid rgba(255,255,255,0.2);
-        }
-        th {
-            font-weight: bold;
-            background: rgba(0,0,0,0.3);
-        }
-        @media (max-width: 768px) {
-            .controls {
-                flex-direction: column;
-                align-items: stretch;
-            }
-            .compare-group {
-                width: 100%;
-            }
-            select, button {
-                width: 100%;
-            }
-            #map {
-                height: {{ map_height_mobile }};
-            }
+            z-index: 1000;
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="controls">
-            <div class="control-group">
-                <label>Дата</label>
-                <select id="date-select">
-                    <option value="">Загрузка дат...</option>
-                </select>
-            </div>
-            <div class="control-group">
-                <label>Слой</label>
-                <select id="layer-select" disabled>
-                    <option value="">Сначала выберите дату</option>
-                </select>
-            </div>
-            <div class="control-group">
-                <label>Прозрачность</label>
-                <div style="display: flex; align-items: center; gap: 8px;">
-                    <input type="range" id="opacity-slider" min="0" max="100" value="{{ default_opacity }}" step="1" style="width: 120px;">
-                    <span id="opacity-value" class="opacity-value">{{ default_opacity }}%</span>
-                </div>
-            </div>
-            <div class="control-group">
-                <button id="apply-btn">Применить</button>
-            </div>
+<div class="container">
+    <div class="controls">
+        <div class="control-group">
+            <label>Дата</label>
+            <select id="date-select"><option value="">Выберите дату</option></select>
         </div>
-
-        {% if enable_compare %}
-        <div class="compare-panel">
-            <h3>Сравнение слоёв</h3>
-            <div style="display: flex; gap: 20px; flex-wrap: wrap;">
-                <div class="compare-group">
-                    <label>Дата 1:</label>
-                    <select id="compare-date1"></select>
-                    <label>Слой 1:</label>
-                    <select id="compare-layer1" disabled></select>
-                </div>
-                <div class="compare-group">
-                    <label>Дата 2:</label>
-                    <select id="compare-date2"></select>
-                    <label>Слой 2:</label>
-                    <select id="compare-layer2" disabled></select>
-                </div>
-                <div class="compare-group">
-                    <button id="compare-btn">Сравнить</button>
-                </div>
-            </div>
-            <div id="compare-results" style="margin-top: 15px; display: none;">
-                <table style="width: 100%; border-collapse: collapse; background: rgba(0,0,0,0.5); border-radius: 8px;">
-                    <thead>
-                        <tr style="border-bottom: 1px solid #ccc;">
-                            <th>Параметр</th>
-                            <th>Слой 1</th>
-                            <th>Слой 2</th>
-                            <th>Разница</th>
-                        </tr>
-                    </thead>
-                    <tbody id="compare-table-body"></tbody>
-                </table>
-            </div>
+        <div class="control-group">
+            <label>Слой</label>
+            <select id="layer-select"><option value="">Выберите слой</option></select>
         </div>
-        {% endif %}
-
-        <div class="map-wrapper">
-            <div id="map"></div>
-            <div id="loading-message" class="loading" style="display: none;">Загрузка...</div>
+        <div class="control-group">
+            <label>Прозрачность</label>
+            <input type="range" id="opacity-slider" min="0" max="100" value="{{ default_opacity * 100 }}">
         </div>
+        <button id="apply-btn">Отобразить</button>
     </div>
 
-    <script>
-        const map = L.map('map').setView({{ default_map_center }}, {{ default_map_zoom }});
-        L.tileLayer('{{ base_tile_url }}', {
-            attribution: '{{ base_attribution }}',
-            maxZoom: {{ base_max_zoom }}
-        }).addTo(map);
+    <div id="map"></div>
 
-        let currentLayer = null;
-        let currentDate = null;
-        let currentLayerType = null;
+    {% if enable_compare %}
+    <div class="controls">
+        <div class="control-group">
+            <label>Сравнение 1</label>
+            <select id="compare-date-1"><option value="">Дата 1</option></select>
+            <select id="compare-layer-1"><option value="">Слой 1</option></select>
+        </div>
+        <div class="control-group">
+            <label>Сравнение 2</label>
+            <select id="compare-date-2"><option value="">Дата 2</option></select>
+            <select id="compare-layer-2"><option value="">Слой 2</option></select>
+        </div>
+        <button id="compare-btn">Анализ</button>
+    </div>
+    <div id="compare-results" class="stats-panel"></div>
+    {% endif %}
+</div>
+<div class="loader" id="loader">Загрузка изображения...</div>
 
-        const dateSelect = document.getElementById('date-select');
-        const layerSelect = document.getElementById('layer-select');
-        const opacitySlider = document.getElementById('opacity-slider');
-        const opacityValue = document.getElementById('opacity-value');
-        const applyBtn = document.getElementById('apply-btn');
-        const loadingDiv = document.getElementById('loading-message');
+<script>
+    const map = L.map('map').setView({{ default_map_center }}, {{ default_map_zoom }});
+    L.tileLayer('{{ default_base_tile_url }}', {
+        attribution: '{{ default_base_attribution }}',
+        maxZoom: {{ default_base_max_zoom }}
+    }).addTo(map);
 
-        const compareDate1 = document.getElementById('compare-date1');
-        const compareDate2 = document.getElementById('compare-date2');
-        const compareLayer1 = document.getElementById('compare-layer1');
-        const compareLayer2 = document.getElementById('compare-layer2');
-        const compareBtn = document.getElementById('compare-btn');
-        const compareResults = document.getElementById('compare-results');
-        const compareTableBody = document.getElementById('compare-table-body');
+    let currentOverlay = null;
 
-        let allDates = [];
-        let layersForDate = {};
+    const dateSelect = document.getElementById('date-select');
+    const layerSelect = document.getElementById('layer-select');
+    const opacitySlider = document.getElementById('opacity-slider');
+    const applyBtn = document.getElementById('apply-btn');
+    const loader = document.getElementById('loader');
 
-        function setLoading(show) {
-            loadingDiv.style.display = show ? 'block' : 'none';
-        }
+    async function loadDates() {
+        const res = await fetch('/api/dates');
+        const dates = await res.json();
+        dates.forEach(date => {
+            const opt = new Option(date, date);
+            dateSelect.add(opt);
+            {% if enable_compare %}
+            document.getElementById('compare-date-1').add(new Option(date, date));
+            document.getElementById('compare-date-2').add(new Option(date, date));
+            {% endif %}
+        });
+    }
 
-        async function loadDates() {
-            setLoading(true);
-            try {
-                const response = await fetch('/api/dates');
-                allDates = await response.json();
-                dateSelect.innerHTML = '<option value="">-- Выберите дату --</option>';
-                if (compareDate1) compareDate1.innerHTML = '<option value="">-- Выберите дату --</option>';
-                if (compareDate2) compareDate2.innerHTML = '<option value="">-- Выберите дату --</option>';
-                if (allDates.length === 0) {
-                    dateSelect.innerHTML = '<option value="">Нет доступных дат</option>';
-                    return;
-                }
-                allDates.forEach(date => {
-                    const option = document.createElement('option');
-                    option.value = date;
-                    option.textContent = date;
-                    dateSelect.appendChild(option);
-                    if (compareDate1) {
-                        const opt1 = option.cloneNode(true);
-                        compareDate1.appendChild(opt1);
-                    }
-                    if (compareDate2) {
-                        const opt2 = option.cloneNode(true);
-                        compareDate2.appendChild(opt2);
-                    }
-                });
-                if (allDates.length > 0) {
-                    dateSelect.value = allDates[0];
-                    await loadLayers(allDates[0]);
-                }
-            } catch (err) {
-                console.error('Ошибка загрузки дат:', err);
-                dateSelect.innerHTML = '<option value="">Ошибка загрузки</option>';
-            } finally {
-                setLoading(false);
-            }
-        }
+    async function loadLayers(date, selectElement) {
+        const res = await fetch(`/api/layers/${date}`);
+        const layers = await res.json();
+        selectElement.innerHTML = '<option value="">Выберите слой</option>';
+        layers.forEach(l => {
+            const opt = new Option(l.layer, l.layer);
+            opt.dataset.bounds = JSON.stringify(l.bounds);
+            opt.dataset.label = l.label;
+            selectElement.add(opt);
+        });
+    }
 
-        async function loadLayers(date, targetSelect = null, isCompare = false) {
-            if (!targetSelect && !isCompare) targetSelect = layerSelect;
-            if (!layersForDate[date]) {
-                setLoading(true);
-                try {
-                    const response = await fetch(`/api/layers/${date}`);
-                    layersForDate[date] = await response.json();
-                } catch (err) {
-                    console.error('Ошибка загрузки слоёв:', err);
-                    return;
-                } finally {
-                    setLoading(false);
-                }
-            }
-            const layers = layersForDate[date];
-            if (targetSelect) {
-                targetSelect.disabled = false;
-                targetSelect.innerHTML = '<option value="">-- Выберите слой --</option>';
-                if (layers.length === 0) {
-                    targetSelect.innerHTML = '<option value="">Нет слоёв для этой даты</option>';
-                    return;
-                }
-                layers.forEach(layer => {
-                    const option = document.createElement('option');
-                    option.value = layer.layer;
-                    option.textContent = layer.layer;
-                    // bounds приходят в формате [minLng, minLat, maxLng, maxLat]
-                    option.dataset.bounds = JSON.stringify(layer.bounds);
-                    targetSelect.appendChild(option);
-                });
-                if (layers.length > 0 && targetSelect === layerSelect && !isCompare) {
-                    targetSelect.value = layers[0].layer;
-                    currentLayerType = layers[0].layer;
-                    updateMapLayer();
-                    const bounds = layers[0].bounds;
-                    if (bounds && bounds.length === 4) {
-                        // Leaflet ожидает [[southWestLat, southWestLng], [northEastLat, northEastLng]]
-                        map.fitBounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]]);
-                    }
-                }
-            }
-        }
-
-        function updateMapLayer() {
-            const date = dateSelect.value;
-            const layerType = layerSelect.value;
-            if (!date || !layerType) return;
-
-            currentDate = date;
-            currentLayerType = layerType;
-
-            if (currentLayer) {
-                map.removeLayer(currentLayer);
-            }
-
-            const opacity = opacitySlider.value / 100;
-            const tileUrl = `/tiles/${date}/${layerType}/{z}/{x}/{y}.png`;
-            currentLayer = L.tileLayer(tileUrl, {
-                opacity: opacity,
-                attribution: 'Спутниковые данные',
-                maxZoom: {{ max_zoom_tiles }}
+    async function loadImage() {
+        const date = dateSelect.value;
+        const layer = layerSelect.value;
+        if (!date || !layer) return;
+        
+        loader.style.display = 'block';
+        try {
+            // Получаем информацию о слое (границы)
+            const layersRes = await fetch(`/api/layers/${date}`);
+            const layers = await layersRes.json();
+            const layerInfo = layers.find(l => l.layer === layer);
+            if (!layerInfo) throw new Error('Слой не найден');
+            const boundsWGS84 = layerInfo.bounds; // [west, south, east, north]
+            const imageBounds = [[boundsWGS84[1], boundsWGS84[0]], [boundsWGS84[3], boundsWGS84[2]]];
+            
+            // Удаляем старый слой
+            if (currentOverlay) map.removeLayer(currentOverlay);
+            
+            // Загружаем изображение
+            const imageUrl = `/api/image/${date}/${layer}`;
+            currentOverlay = L.imageOverlay(imageUrl, imageBounds, {
+                opacity: opacitySlider.value / 100,
+                interactive: true
             }).addTo(map);
+            
+            // Автоматически центрируем карту по границам изображения
+            map.fitBounds(imageBounds);
+        } catch (err) {
+            console.error(err);
+            alert('Ошибка загрузки изображения: ' + err.message);
+        } finally {
+            loader.style.display = 'none';
         }
+    }
 
-        function updateOpacity() {
-            const val = opacitySlider.value;
-            opacityValue.textContent = val + '%';
-            if (currentLayer) {
-                currentLayer.setOpacity(val / 100);
-            }
+    dateSelect.addEventListener('change', (e) => loadLayers(e.target.value, layerSelect));
+    layerSelect.addEventListener('change', () => {
+        // Опционально: автоматически загружать изображение при выборе слоя
+        // loadImage();
+    });
+    applyBtn.addEventListener('click', loadImage);
+    opacitySlider.addEventListener('input', () => {
+        if (currentOverlay) currentOverlay.setOpacity(opacitySlider.value / 100);
+    });
+
+    loadDates();
+
+    {% if enable_compare %}
+    const compareDate1 = document.getElementById('compare-date-1');
+    const compareLayer1 = document.getElementById('compare-layer-1');
+    const compareDate2 = document.getElementById('compare-date-2');
+    const compareLayer2 = document.getElementById('compare-layer-2');
+    const compareBtn = document.getElementById('compare-btn');
+    const compareResults = document.getElementById('compare-results');
+
+    compareDate1.addEventListener('change', (e) => loadLayers(e.target.value, compareLayer1));
+    compareDate2.addEventListener('change', (e) => loadLayers(e.target.value, compareLayer2));
+
+    async function performCompare() {
+        const date1 = compareDate1.value;
+        const layer1 = compareLayer1.value;
+        const date2 = compareDate2.value;
+        const layer2 = compareLayer2.value;
+        if (!date1 || !layer1 || !date2 || !layer2) {
+            alert('Пожалуйста, выберите обе пары (дата + слой)');
+            return;
         }
-
-        async function compare() {
-            const date1 = compareDate1.value;
-            const layer1 = compareLayer1.value;
-            const date2 = compareDate2.value;
-            const layer2 = compareLayer2.value;
-            if (!date1 || !layer1 || !date2 || !layer2) {
-                alert('Выберите обе даты и слои для сравнения');
-                return;
-            }
-            setLoading(true);
-            try {
-                const response = await fetch('/api/compare', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({date1, layer1, date2, layer2})
-                });
-                const data = await response.json();
-                displayComparison(data);
-            } catch (err) {
-                console.error('Ошибка сравнения:', err);
-                alert('Ошибка при сравнении');
-            } finally {
-                setLoading(false);
-            }
-        }
-
-        function displayComparison(data) {
+        try {
+            const response = await fetch('/api/compare', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ date1, layer1, date2, layer2 })
+            });
+            const data = await response.json();
+            compareResults.innerHTML = '';
+            const card1 = document.createElement('div');
+            card1.className = 'stats-card';
+            const card2 = document.createElement('div');
+            card2.className = 'stats-card';
+            card1.innerHTML = `<h3>${data.layer1.label} (${data.layer1.date})</h3>`;
+            card2.innerHTML = `<h3>${data.layer2.label} (${data.layer2.date})</h3>`;
             const stats1 = data.layer1.statistics;
             const stats2 = data.layer2.statistics;
-            const params = ['min', 'max', 'mean', 'stddev', 'valid_percent'];
-            compareTableBody.innerHTML = '';
-            for (let param of params) {
-                let val1 = stats1[param] !== null ? stats1[param].toFixed(2) : '—';
-                let val2 = stats2[param] !== null ? stats2[param].toFixed(2) : '—';
-                let diff = '';
-                if (stats1[param] !== null && stats2[param] !== null) {
-                    let delta = stats2[param] - stats1[param];
-                    diff = delta.toFixed(2);
+            card1.innerHTML += `
+                <p>Min: ${stats1.min?.toFixed(4) ?? '—'}</p>
+                <p>Max: ${stats1.max?.toFixed(4) ?? '—'}</p>
+                <p>Mean: ${stats1.mean?.toFixed(4) ?? '—'}</p>
+                <p>StdDev: ${stats1.stddev?.toFixed(4) ?? '—'}</p>
+            `;
+            card2.innerHTML += `
+                <p>Min: ${stats2.min?.toFixed(4) ?? '—'}</p>
+                <p>Max: ${stats2.max?.toFixed(4) ?? '—'}</p>
+                <p>Mean: ${stats2.mean?.toFixed(4) ?? '—'}</p>
+                <p>StdDev: ${stats2.stddev?.toFixed(4) ?? '—'}</p>
+            `;
+            if ({{ show_histograms | lower }}) {
+                if (stats1.histogram && stats1.histogram.length) {
+                    const canvas1 = document.createElement('canvas');
+                    canvas1.width = 300;
+                    canvas1.height = 150;
+                    canvas1.style.maxWidth = '100%';
+                    card1.appendChild(canvas1);
+                    new Chart(canvas1, {
+                        type: 'bar',
+                        data: { labels: Array(stats1.histogram.length).fill(''), datasets: [{ label: 'Частота', data: stats1.histogram, backgroundColor: 'rgba(75,192,192,0.4)' }] },
+                        options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { labels: { color: 'white' } } } }
+                    });
                 }
-                const row = `
-                    <tr>
-                        <td>${param.toUpperCase()}</td>
-                        <td>${val1}</td>
-                        <td>${val2}</td>
-                        <td>${diff}</td>
-                    </tr>`;
-                compareTableBody.insertAdjacentHTML('beforeend', row);
-            }
-            compareResults.style.display = 'block';
-        }
-
-        dateSelect.addEventListener('change', async (e) => {
-            const date = e.target.value;
-            if (!date) return;
-            await loadLayers(date, layerSelect);
-        });
-
-        layerSelect.addEventListener('change', (e) => {
-            const selectedOption = e.target.options[e.target.selectedIndex];
-            if (selectedOption && selectedOption.dataset.bounds) {
-                const bounds = JSON.parse(selectedOption.dataset.bounds);
-                if (bounds && bounds.length === 4) {
-                    map.fitBounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]]);
+                if (stats2.histogram && stats2.histogram.length) {
+                    const canvas2 = document.createElement('canvas');
+                    canvas2.width = 300;
+                    canvas2.height = 150;
+                    canvas2.style.maxWidth = '100%';
+                    card2.appendChild(canvas2);
+                    new Chart(canvas2, {
+                        type: 'bar',
+                        data: { labels: Array(stats2.histogram.length).fill(''), datasets: [{ label: 'Частота', data: stats2.histogram, backgroundColor: 'rgba(153,102,255,0.4)' }] },
+                        options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { labels: { color: 'white' } } } }
+                    });
                 }
             }
-            if (e.target.value) {
-                updateMapLayer();
-            }
-        });
-
-        opacitySlider.addEventListener('input', updateOpacity);
-
-        applyBtn.addEventListener('click', () => {
-            if (currentDate && currentLayerType) {
-                updateMapLayer();
-            } else {
-                alert('Выберите дату и слой');
-            }
-        });
-
-        if (compareDate1) {
-            compareDate1.addEventListener('change', async (e) => {
-                const date = e.target.value;
-                if (date) await loadLayers(date, compareLayer1, true);
-            });
-            compareDate2.addEventListener('change', async (e) => {
-                const date = e.target.value;
-                if (date) await loadLayers(date, compareLayer2, true);
-            });
-            compareBtn.addEventListener('click', compare);
+            compareResults.appendChild(card1);
+            compareResults.appendChild(card2);
+        } catch (err) {
+            console.error(err);
+            compareResults.innerHTML = '<div class="stats-card">Ошибка загрузки данных сравнения</div>';
         }
-
-        loadDates();
-    </script>
+    }
+    compareBtn.addEventListener('click', performCompare);
+    {% endif %}
+</script>
 </body>
 </html>

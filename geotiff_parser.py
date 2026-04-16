@@ -2,22 +2,42 @@ import rasterio
 import numpy as np
 from rasterio.warp import transform_bounds
 from logger import app_logger
+import re
+
+def guess_crs_from_filename(filename: str):
+    match = re.search(r'T(\d{2})([A-Z]{3})', filename)
+    if match:
+        zone = int(match.group(1))
+        lat_band = match.group(2)
+        if lat_band >= 'N':
+            return f"EPSG:326{zone:02d}"
+        else:
+            return f"EPSG:327{zone:02d}"
+    return None
 
 def parse_geotiff_metadata(filepath):
     try:
         with rasterio.open(filepath) as src:
-            bounds = src.bounds  # (left, bottom, right, top) в CRS файла
+            bounds = src.bounds
             crs = src.crs.to_string() if src.crs else None
+
+            if crs is None:
+                guessed = guess_crs_from_filename(filepath)
+                if guessed:
+                    crs = guessed
+                    app_logger.info(f"Угадан CRS для {filepath}: {crs}")
+                else:
+                    app_logger.warning(f"Не удалось определить CRS для {filepath}")
+
             width = src.width
             height = src.height
 
-            # Преобразование границ в WGS84, если есть CRS
-            if src.crs:
+            if crs:
                 try:
-                    bounds_wgs84 = transform_bounds(src.crs, 'EPSG:4326', *bounds)
+                    bounds_wgs84 = transform_bounds(crs, 'EPSG:4326', *bounds)
                 except Exception as e:
                     app_logger.warning(f"Ошибка преобразования bounds для {filepath}: {e}")
-                    bounds_wgs84 = bounds  # fallback
+                    bounds_wgs84 = bounds
             else:
                 bounds_wgs84 = bounds
 
@@ -53,7 +73,7 @@ def parse_geotiff_metadata(filepath):
                 'stddev': stats['stddev'] if not np.isnan(stats['stddev']) else None
             }
     except Exception as e:
-        app_logger.warning(f"Не удалось прочитать метаданные {filepath}: {e}")
+        app_logger.error(f"Не удалось прочитать метаданные {filepath}: {e}", exc_info=True)
         return {
             'bounds': (-180, -90, 180, 90),
             'bounds_wgs84': (-180, -90, 180, 90),

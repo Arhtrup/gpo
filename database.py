@@ -22,7 +22,8 @@ def init_db():
                 max_value REAL,
                 mean_value REAL,
                 stddev REAL,
-                bounds_wgs84 TEXT
+                bounds_wgs84 TEXT,
+                histogram TEXT
             )
         ''')
         existing_columns = [col[1] for col in c.execute("PRAGMA table_info(images)")]
@@ -30,12 +31,14 @@ def init_db():
         for col, col_type in [('crs', 'TEXT'), ('width', 'INTEGER'), ('height', 'INTEGER'),
                               ('min_value', 'REAL'), ('max_value', 'REAL'),
                               ('mean_value', 'REAL'), ('stddev', 'REAL'),
-                              ('bounds_wgs84', 'TEXT')]:
+                              ('bounds_wgs84', 'TEXT'), ('histogram', 'TEXT')]:
             if col not in existing_columns:
                 c.execute(f"ALTER TABLE images ADD COLUMN {col} {col_type}")
                 added += 1
+        c.execute("CREATE INDEX IF NOT EXISTS idx_date ON images(date)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_layer ON images(layer_type)")
         conn.commit()
-        app_logger.info(f"База данных инициализирована: {DATABASE_PATH} (добавлено колонок: {added})")
+        app_logger.info(f"База данных инициализирована (добавлено колонок: {added})")
     except Exception as e:
         app_logger.error(f"Ошибка инициализации БД: {e}", exc_info=True)
         raise
@@ -49,12 +52,13 @@ def add_image(info: SatelliteImageInfo):
         c.execute(
             """INSERT OR REPLACE INTO images 
                (filename, date, layer_type, bounds, tile_id, crs, width, height,
-                min_value, max_value, mean_value, stddev, bounds_wgs84)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                min_value, max_value, mean_value, stddev, bounds_wgs84, histogram)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (info.filename, info.date.isoformat(), info.layer_type, json.dumps(info.bounds), info.tile_id,
              info.crs, info.width, info.height,
              info.min_value, info.max_value, info.mean_value, info.stddev,
-             json.dumps(info.bounds_wgs84) if info.bounds_wgs84 else None)
+             json.dumps(info.bounds_wgs84) if info.bounds_wgs84 else None,
+             json.dumps(info.histogram) if info.histogram else None)
         )
         conn.commit()
         app_logger.debug(f"Добавлена/обновлена запись: {info.filename}")
@@ -79,22 +83,21 @@ def get_layers_for_date(date_str: str):
     conn.close()
     return result
 
-def get_image_by_layer_and_date(date_str: str, layer: str):
+def get_image_info_by_layer_and_date(date_str: str, layer: str):
     conn = sqlite3.connect(DATABASE_PATH)
     c = conn.cursor()
-    c.execute("SELECT filename, bounds FROM images WHERE date = ? AND layer_type = ?", (date_str, layer))
+    c.execute("SELECT filename, bounds_wgs84, crs FROM images WHERE date = ? AND layer_type = ?", (date_str, layer))
     row = c.fetchone()
     conn.close()
     if row:
-        return {"filename": row[0], "bounds": json.loads(row[1])}
+        return {"filename": row[0], "bounds": json.loads(row[1]), "crs": row[2]}
     return None
 
-# НОВАЯ ФУНКЦИЯ: получение статистики из БД
 def get_statistics_for_layer(date: str, layer: str):
     conn = sqlite3.connect(DATABASE_PATH)
     c = conn.cursor()
     c.execute("""
-        SELECT min_value, max_value, mean_value, stddev 
+        SELECT min_value, max_value, mean_value, stddev, histogram
         FROM images WHERE date = ? AND layer_type = ?
     """, (date, layer))
     row = c.fetchone()
@@ -105,6 +108,6 @@ def get_statistics_for_layer(date: str, layer: str):
             "max": row[1],
             "mean": row[2],
             "stddev": row[3],
-            "valid_percent": None   # можно расширить при необходимости
+            "histogram": json.loads(row[4]) if row[4] else None
         }
     return None
