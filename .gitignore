@@ -1,0 +1,13 @@
+*.log
+/tiff/
+/share/
+/logs/
+/lib64/
+/__pycache__/
+/bin/
+/images/
+/include/
+/lib/
+/venv/
+*.db
+pyvenv.cfg
