@@ -11,3 +11,5 @@
 /venv/
 *.db
 pyvenv.cfg
+lib64
+/.vscode/
