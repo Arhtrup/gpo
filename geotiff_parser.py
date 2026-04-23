@@ -9,7 +9,6 @@ def guess_crs_from_filename(filename: str):
     if match:
         zone = int(match.group(1))
         lat_band = match.group(2)
-        # Северное полушарие: зоны N, а также экваториальные A-H
         if lat_band[0] in 'NABCDEFGH':
             return f"EPSG:326{zone:02d}"
         else:
@@ -20,7 +19,7 @@ def parse_geotiff_metadata(filepath):
     try:
         with rasterio.open(filepath) as src:
             bounds = src.bounds
-            # Удалён лишний print(src.transform)
+            # удалён print(src.transform)
             crs = src.crs.to_string() if src.crs else None
 
             if crs is None:

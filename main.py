@@ -8,9 +8,11 @@ from datetime import datetime
 import json
 import rasterio
 from rasterio.warp import transform_bounds
+from rasterio.windows import Window
 import numpy as np
 from PIL import Image
 import io
+import base64
 import database
 from geotiff_parser import parse_geotiff_metadata, guess_crs_from_filename
 from logger import app_logger
@@ -20,7 +22,7 @@ from settings import (
     COLOR_SELECT_BG, COLOR_SELECT_HOVER, COLOR_TEXT_LIGHT,
     MAP_HEIGHT, MAP_HEIGHT_MOBILE, CONTROLS_PADDING,
     DEFAULT_OPACITY, DEFAULT_MAP_ZOOM, DEFAULT_MAP_CENTER,
-    HOST, PORT, ENABLE_COMPARE, COMPARE_SHOW_HISTOGRAMS, COMPARE_HISTOGRAM_BINS,
+    HOST, PORT, ENABLE_COMPARE, COMPARE_SHOW_HISTOGRAMS, COMPARE_HISTOGRAM_BINS, COMPARE_AREA_SIZE,
     DEFAULT_BASE_TILE_URL, DEFAULT_BASE_ATTRIBUTION, DEFAULT_BASE_MAX_ZOOM,
     TEMPLATES_DIR, CORS_ALLOW_ORIGINS, CORS_ALLOW_METHODS, CORS_ALLOW_HEADERS,
     LAYER_LABELS, MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT
@@ -36,7 +38,6 @@ def migrate_crs():
     try:
         conn = sqlite3.connect(database.DATABASE_PATH)
         c = conn.cursor()
-        # Проверка существования колонки crs
         c.execute("PRAGMA table_info(images)")
         columns = [col[1] for col in c.fetchall()]
         if 'crs' not in columns:
@@ -156,7 +157,6 @@ async def get_layers(date: str):
 
 @app.get("/api/image/{date}/{layer}")
 async def get_full_image(date: str, layer: str):
-    """Возвращает полноразмерное изображение (PNG) после ресемплинга до разумных размеров"""
     img_info = database.get_image_info_by_layer_and_date(date, layer)
     if not img_info:
         raise HTTPException(status_code=404, detail="Layer not found")
@@ -166,7 +166,6 @@ async def get_full_image(date: str, layer: str):
     filepath = os.path.join(IMAGES_DIR, img_info["filename"])
     try:
         with rasterio.open(filepath) as src:
-            # Читаем все каналы (1 или 3)
             if src.count == 1:
                 data = src.read(1)
                 if src.nodata is not None:
@@ -182,7 +181,6 @@ async def get_full_image(date: str, layer: str):
                 if src.nodata is not None:
                     data = np.where(data == src.nodata, np.nan, data)
                 data = np.nan_to_num(data, nan=0.0)
-                # Нормализация каждого канала отдельно
                 for i in range(3):
                     ch = data[i]
                     ch_min, ch_max = ch.min(), ch.max()
@@ -191,12 +189,11 @@ async def get_full_image(date: str, layer: str):
                     else:
                         data[i] = np.zeros_like(ch)
                 data = data.astype(np.uint8)
-                data = np.moveaxis(data, 0, -1)  # (H, W, 3)
+                data = np.moveaxis(data, 0, -1)
                 img = Image.fromarray(data, mode='RGB')
             else:
                 raise HTTPException(status_code=500, detail="Unsupported band count")
             
-            # Ресемплинг, если изображение слишком большое
             if img.width > MAX_IMAGE_WIDTH or img.height > MAX_IMAGE_HEIGHT:
                 ratio = min(MAX_IMAGE_WIDTH / img.width, MAX_IMAGE_HEIGHT / img.height)
                 new_size = (int(img.width * ratio), int(img.height * ratio))
@@ -214,14 +211,7 @@ async def get_full_image(date: str, layer: str):
 async def get_layer_statistics(date: str, layer: str):
     stats = database.get_statistics_for_layer(date, layer)
     if not stats:
-        # Возвращаем пустую статистику вместо 404
-        return {
-            "min": None,
-            "max": None,
-            "mean": None,
-            "stddev": None,
-            "histogram": None
-        }
+        return {"min": None, "max": None, "mean": None, "stddev": None, "histogram": None}
     return stats
 
 @app.post("/api/compare")
@@ -238,6 +228,88 @@ async def compare_layers(request: dict):
         "layer1": {"date": date1, "layer": layer1, "statistics": stats1, "label": LAYER_LABELS.get(layer1, layer1)},
         "layer2": {"date": date2, "layer": layer2, "statistics": stats2, "label": LAYER_LABELS.get(layer2, layer2)}
     }
+
+def extract_image_from_bbox(filepath, bbox_wgs84, target_size):
+    with rasterio.open(filepath) as src:
+        if not src.crs:
+            raise ValueError(f"No CRS for {filepath}")
+        left, bottom, right, top = bbox_wgs84
+        bounds_src = transform_bounds("EPSG:4326", src.crs, left, bottom, right, top)
+        window = src.window(*bounds_src)
+        window = window.round_lengths().round_offsets()
+        window = window.intersection(Window(0, 0, src.width, src.height))
+        if window.width == 0 or window.height == 0:
+            return None
+        if src.count == 1:
+            data = src.read(1, window=window).astype(np.float32)
+        else:
+            data = src.read(window=window).astype(np.float32)
+            data = np.mean(data, axis=0)
+        if src.nodata is not None:
+            data = np.where(data == src.nodata, np.nan, data)
+        data = np.nan_to_num(data, nan=0.0)
+        dmin, dmax = data.min(), data.max()
+        if dmax - dmin > 1e-6:
+            data = ((data - dmin) / (dmax - dmin) * 255).astype(np.uint8)
+        else:
+            data = np.zeros_like(data, dtype=np.uint8)
+        if data.shape != target_size:
+            img = Image.fromarray(data)
+            img = img.resize(target_size, Image.Resampling.BILINEAR)
+            data = np.array(img)
+        return data
+
+@app.post("/api/compare-area")
+async def compare_area(request: dict):
+    date1 = request.get("date1")
+    layer1 = request.get("layer1")
+    date2 = request.get("date2")
+    layer2 = request.get("layer2")
+    bbox = request.get("bbox")
+    if not all([date1, layer1, date2, layer2, bbox]) or len(bbox) != 4:
+        raise HTTPException(status_code=400, detail="Missing parameters or invalid bbox")
+    
+    img_info1 = database.get_image_info_by_layer_and_date(date1, layer1)
+    img_info2 = database.get_image_info_by_layer_and_date(date2, layer2)
+    if not img_info1 or not img_info2:
+        raise HTTPException(status_code=404, detail="Layer not found")
+    
+    filepath1 = os.path.join(IMAGES_DIR, img_info1["filename"])
+    filepath2 = os.path.join(IMAGES_DIR, img_info2["filename"])
+    
+    try:
+        target_size = COMPARE_AREA_SIZE
+        data1 = extract_image_from_bbox(filepath1, bbox, target_size)
+        data2 = extract_image_from_bbox(filepath2, bbox, target_size)
+        if data1 is None or data2 is None:
+            raise HTTPException(status_code=400, detail="Selected area is outside the image bounds")
+        
+        diff = np.abs(data1.astype(np.float32) - data2.astype(np.float32))
+        diff_min = float(np.min(diff))
+        diff_max = float(np.max(diff))
+        diff_mean = float(np.mean(diff))
+        diff_std = float(np.std(diff))
+        hist, _ = np.histogram(diff, bins=50, range=(0, 255))
+        
+        diff_img = Image.fromarray(diff.astype(np.uint8), mode='L').convert('RGB')
+        img_bytes = io.BytesIO()
+        diff_img.save(img_bytes, format='PNG')
+        img_bytes.seek(0)
+        img_base64 = base64.b64encode(img_bytes.getvalue()).decode('utf-8')
+        
+        return {
+            "statistics": {
+                "min": diff_min,
+                "max": diff_max,
+                "mean": diff_mean,
+                "stddev": diff_std,
+                "histogram": hist.tolist()
+            },
+            "image": f"data:image/png;base64,{img_base64}"
+        }
+    except Exception as e:
+        app_logger.error(f"Ошибка сравнения областей: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/", response_class=HTMLResponse)
 async def get_map(request: Request):

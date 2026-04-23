@@ -5,7 +5,9 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"/>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -80,6 +82,13 @@
             border-radius: 8px;
             z-index: 1000;
         }
+        .area-info {
+            color: white;
+            font-size: 0.8rem;
+            background: rgba(0,0,0,0.5);
+            padding: 5px 10px;
+            border-radius: 8px;
+        }
     </style>
 </head>
 <body>
@@ -114,12 +123,22 @@
             <select id="compare-date-2"><option value="">Дата 2</option></select>
             <select id="compare-layer-2"><option value="">Слой 2</option></select>
         </div>
-        <button id="compare-btn">Анализ</button>
+        <button id="compare-btn">Сравнить статистику</button>
     </div>
     <div id="compare-results" class="stats-panel"></div>
+
+    <div class="controls">
+        <div class="control-group">
+            <label>Сравнение по области</label>
+            <button id="select-area-btn" style="background: #ff9800;">Выбрать область</button>
+            <button id="clear-area-btn" style="background: #f44336;">Очистить</button>
+        </div>
+        <div id="area-info" class="area-info"></div>
+    </div>
+    <div id="compare-area-results" class="stats-panel" style="display: none;"></div>
     {% endif %}
 </div>
-<div class="loader" id="loader">Загрузка изображения...</div>
+<div class="loader" id="loader">Загрузка...</div>
 
 <script>
     const map = L.map('map').setView({{ default_map_center }}, {{ default_map_zoom }});
@@ -130,6 +149,9 @@
 
     let currentOverlay = null;
     let currentImageRequest = null;
+    let drawControl = null;
+    let drawnItems = null;
+    let selectedBbox = null;
 
     const dateSelect = document.getElementById('date-select');
     const layerSelect = document.getElementById('layer-select');
@@ -137,29 +159,49 @@
     const applyBtn = document.getElementById('apply-btn');
     const loader = document.getElementById('loader');
 
+    function showLoader() { loader.style.display = 'block'; }
+    function hideLoader() { loader.style.display = 'none'; }
+
     async function loadDates() {
-        const res = await fetch('/api/dates');
-        const dates = await res.json();
-        dates.forEach(date => {
-            const opt = new Option(date, date);
-            dateSelect.add(opt);
-            {% if enable_compare %}
-            document.getElementById('compare-date-1').add(new Option(date, date));
-            document.getElementById('compare-date-2').add(new Option(date, date));
-            {% endif %}
-        });
+        showLoader();
+        try {
+            const res = await fetch('/api/dates');
+            const dates = await res.json();
+            dates.forEach(date => {
+                const opt = new Option(date, date);
+                dateSelect.add(opt);
+                {% if enable_compare %}
+                document.getElementById('compare-date-1').add(new Option(date, date));
+                document.getElementById('compare-date-2').add(new Option(date, date));
+                {% endif %}
+            });
+        } catch (err) {
+            console.error(err);
+            alert('Ошибка загрузки дат');
+        } finally {
+            hideLoader();
+        }
     }
 
     async function loadLayers(date, selectElement) {
-        const res = await fetch(`/api/layers/${date}`);
-        const layers = await res.json();
-        selectElement.innerHTML = '<option value="">Выберите слой</option>';
-        layers.forEach(l => {
-            const opt = new Option(l.layer, l.layer);
-            opt.dataset.bounds = JSON.stringify(l.bounds);
-            opt.dataset.label = l.label;
-            selectElement.add(opt);
-        });
+        if (!date) return;
+        showLoader();
+        try {
+            const res = await fetch(`/api/layers/${date}`);
+            const layers = await res.json();
+            selectElement.innerHTML = '<option value="">Выберите слой</option>';
+            layers.forEach(l => {
+                const opt = new Option(l.layer, l.layer);
+                opt.dataset.bounds = JSON.stringify(l.bounds);
+                opt.dataset.label = l.label;
+                selectElement.add(opt);
+            });
+        } catch (err) {
+            console.error(err);
+            alert('Ошибка загрузки слоёв');
+        } finally {
+            hideLoader();
+        }
     }
 
     async function loadImage() {
@@ -167,18 +209,17 @@
         const layer = layerSelect.value;
         if (!date || !layer) return;
         
-        // Отменяем предыдущий запрос, если он ещё выполняется
         if (currentImageRequest) {
             currentImageRequest.abort();
         }
-        
-        loader.style.display = 'block';
+        let controller;
+        showLoader();
         try {
             const layersRes = await fetch(`/api/layers/${date}`);
             const layers = await layersRes.json();
             const layerInfo = layers.find(l => l.layer === layer);
             if (!layerInfo) throw new Error('Слой не найден');
-            const boundsWGS84 = layerInfo.bounds; // [west, south, east, north]
+            const boundsWGS84 = layerInfo.bounds;
             const imageBounds = [[boundsWGS84[1], boundsWGS84[0]], [boundsWGS84[3], boundsWGS84[2]]];
             
             if (currentOverlay) map.removeLayer(currentOverlay);
@@ -189,13 +230,12 @@
             const img = new Image();
             img.crossOrigin = "Anonymous";
             
-            const imageLoadPromise = new Promise((resolve, reject) => {
+            await new Promise((resolve, reject) => {
                 img.onload = () => resolve(img);
                 img.onerror = () => reject(new Error('Не удалось загрузить изображение'));
                 img.src = imageUrl;
             });
             
-            await imageLoadPromise;
             currentOverlay = L.imageOverlay(imageUrl, imageBounds, {
                 opacity: opacitySlider.value / 100,
                 interactive: true
@@ -209,7 +249,7 @@
             }
         } finally {
             if (currentImageRequest === controller) currentImageRequest = null;
-            loader.style.display = 'none';
+            hideLoader();
         }
     }
 
@@ -241,6 +281,7 @@
             alert('Пожалуйста, выберите обе пары (дата + слой)');
             return;
         }
+        showLoader();
         try {
             const response = await fetch('/api/compare', {
                 method: 'POST',
@@ -274,7 +315,6 @@
                     const canvas1 = document.createElement('canvas');
                     canvas1.width = 300;
                     canvas1.height = 150;
-                    canvas1.style.maxWidth = '100%';
                     card1.appendChild(canvas1);
                     new Chart(canvas1, {
                         type: 'bar',
@@ -286,7 +326,6 @@
                     const canvas2 = document.createElement('canvas');
                     canvas2.width = 300;
                     canvas2.height = 150;
-                    canvas2.style.maxWidth = '100%';
                     card2.appendChild(canvas2);
                     new Chart(canvas2, {
                         type: 'bar',
@@ -300,9 +339,114 @@
         } catch (err) {
             console.error(err);
             compareResults.innerHTML = '<div class="stats-card">Ошибка загрузки данных сравнения</div>';
+        } finally {
+            hideLoader();
         }
     }
     compareBtn.addEventListener('click', performCompare);
+
+    // Сравнение по области
+    const selectAreaBtn = document.getElementById('select-area-btn');
+    const clearAreaBtn = document.getElementById('clear-area-btn');
+    const areaInfoDiv = document.getElementById('area-info');
+    const compareAreaResults = document.getElementById('compare-area-results');
+
+    function enableAreaSelection() {
+        if (drawnItems) map.removeLayer(drawnItems);
+        drawnItems = L.featureGroup().addTo(map);
+        drawControl = new L.Draw.Rectangle(map, {
+            shapeOptions: { color: '#ff9800', weight: 2 }
+        });
+        drawControl.enable();
+        
+        map.once('draw:created', function(e) {
+            const layer = e.layer;
+            drawnItems.addLayer(layer);
+            const bounds = layer.getBounds();
+            const west = bounds.getWest();
+            const south = bounds.getSouth();
+            const east = bounds.getEast();
+            const north = bounds.getNorth();
+            selectedBbox = [west, south, east, north];
+            areaInfoDiv.innerHTML = `Область: ${west.toFixed(4)}, ${south.toFixed(4)} - ${east.toFixed(4)}, ${north.toFixed(4)}`;
+            if (drawControl) drawControl.disable();
+            // автоматически сравнить, если выбраны слои
+            const date1 = compareDate1.value;
+            const layer1 = compareLayer1.value;
+            const date2 = compareDate2.value;
+            const layer2 = compareLayer2.value;
+            if (date1 && layer1 && date2 && layer2) {
+                performAreaCompare();
+            }
+        });
+    }
+
+    function clearArea() {
+        if (drawnItems) map.removeLayer(drawnItems);
+        if (drawControl) drawControl.disable();
+        selectedBbox = null;
+        areaInfoDiv.innerHTML = '';
+        compareAreaResults.style.display = 'none';
+    }
+
+    async function performAreaCompare() {
+        const date1 = compareDate1.value;
+        const layer1 = compareLayer1.value;
+        const date2 = compareDate2.value;
+        const layer2 = compareLayer2.value;
+        if (!date1 || !layer1 || !date2 || !layer2) {
+            alert('Выберите обе пары (дата + слой) для сравнения');
+            return;
+        }
+        if (!selectedBbox) {
+            alert('Сначала выберите область на карте');
+            return;
+        }
+        showLoader();
+        try {
+            const response = await fetch('/api/compare-area', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    date1, layer1, date2, layer2,
+                    bbox: selectedBbox
+                })
+            });
+            const data = await response.json();
+            const stats = data.statistics;
+            const imgSrc = data.image;
+            
+            compareAreaResults.innerHTML = `
+                <div class="stats-card">
+                    <h3>Разница: ${layer1} (${date1}) - ${layer2} (${date2})</h3>
+                    <p>Min: ${stats.min.toFixed(4)}</p>
+                    <p>Max: ${stats.max.toFixed(4)}</p>
+                    <p>Mean: ${stats.mean.toFixed(4)}</p>
+                    <p>StdDev: ${stats.stddev.toFixed(4)}</p>
+                    <canvas id="diff-histogram" width="300" height="150" style="max-width:100%"></canvas>
+                    <img src="${imgSrc}" style="max-width:100%; margin-top:10px; border:1px solid #ccc;" />
+                </div>
+            `;
+            const ctx = document.getElementById('diff-histogram').getContext('2d');
+            new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: Array(stats.histogram.length).fill(''),
+                    datasets: [{ label: 'Частота разницы', data: stats.histogram, backgroundColor: 'rgba(255,99,132,0.4)' }]
+                },
+                options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { labels: { color: 'white' } } } }
+            });
+            compareAreaResults.style.display = 'grid';
+        } catch (err) {
+            console.error(err);
+            alert('Ошибка при сравнении областей: ' + err.message);
+        } finally {
+            hideLoader();
+        }
+    }
+
+    selectAreaBtn.addEventListener('click', enableAreaSelection);
+    clearAreaBtn.addEventListener('click', clearArea);
     {% endif %}
 </script>
 </body>
