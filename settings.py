@@ -7,10 +7,12 @@ TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 
 PRODUCT_SUBDIRS = ['TCI', 'NDVI', 'NDWI']
 
-# Ограничения для выходного изображения (чтобы не перегружать браузер)
+# Параметры для репроекции
 MAX_IMAGE_WIDTH = 2048
 MAX_IMAGE_HEIGHT = 2048
-IMAGE_QUALITY = 85  # для JPEG
+IMAGE_QUALITY = 85
+REPROJECT_RESAMPLING = "bilinear"
+WGS84_EPSG = "EPSG:4326"
 
 DEFAULT_BASE_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 DEFAULT_BASE_ATTRIBUTION = "© OpenStreetMap contributors"
@@ -18,9 +20,9 @@ DEFAULT_BASE_MAX_ZOOM = 19
 
 DEFAULT_MAP_ZOOM = 2
 DEFAULT_MAP_CENTER = [0, 0]
-DEFAULT_OPACITY = 70  # процентов
+DEFAULT_OPACITY = 70
 
-WEB_TITLE = "Спутниковый просмотрщик (полное изображение)"
+WEB_TITLE = "Спутниковый просмотрщик (с выпрямлением)"
 COLOR_BACKGROUND = "linear-gradient(135deg, #1e3c72 0%, #2a5298 100%)"
 COLOR_CONTROLS_BG = "rgba(0,0,0,0.7)"
 COLOR_BUTTON = "#4caf50"

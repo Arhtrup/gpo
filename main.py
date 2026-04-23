@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime
 import json
 import rasterio
-from rasterio.warp import transform_bounds, reproject, Resampling
+from rasterio.warp import transform_bounds
 import numpy as np
 from PIL import Image
 import io
@@ -23,7 +23,7 @@ from settings import (
     HOST, PORT, ENABLE_COMPARE, COMPARE_SHOW_HISTOGRAMS, COMPARE_HISTOGRAM_BINS,
     DEFAULT_BASE_TILE_URL, DEFAULT_BASE_ATTRIBUTION, DEFAULT_BASE_MAX_ZOOM,
     TEMPLATES_DIR, CORS_ALLOW_ORIGINS, CORS_ALLOW_METHODS, CORS_ALLOW_HEADERS,
-    LAYER_LABELS, MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT, IMAGE_QUALITY
+    LAYER_LABELS, MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT
 )
 from models import SatelliteImageInfo
 
@@ -33,20 +33,30 @@ if DB_INIT_TABLE:
     database.init_db()
 
 def migrate_crs():
-    conn = sqlite3.connect(database.DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("SELECT filename, crs FROM images WHERE crs IS NULL")
-    rows = c.fetchall()
-    updated = 0
-    for filename, _ in rows:
-        guessed = guess_crs_from_filename(filename)
-        if guessed:
-            c.execute("UPDATE images SET crs = ? WHERE filename = ?", (guessed, filename))
-            updated += 1
-            app_logger.info(f"Обновлён CRS для {filename} -> {guessed}")
-    conn.commit()
-    conn.close()
-    app_logger.info(f"Миграция CRS завершена, обновлено записей: {updated}")
+    try:
+        conn = sqlite3.connect(database.DATABASE_PATH)
+        c = conn.cursor()
+        # Проверка существования колонки crs
+        c.execute("PRAGMA table_info(images)")
+        columns = [col[1] for col in c.fetchall()]
+        if 'crs' not in columns:
+            app_logger.warning("Колонка crs отсутствует, миграция не требуется")
+            conn.close()
+            return
+        c.execute("SELECT filename, crs FROM images WHERE crs IS NULL")
+        rows = c.fetchall()
+        updated = 0
+        for filename, _ in rows:
+            guessed = guess_crs_from_filename(filename)
+            if guessed:
+                c.execute("UPDATE images SET crs = ? WHERE filename = ?", (guessed, filename))
+                updated += 1
+                app_logger.info(f"Обновлён CRS для {filename} -> {guessed}")
+        conn.commit()
+        conn.close()
+        app_logger.info(f"Миграция CRS завершена, обновлено записей: {updated}")
+    except Exception as e:
+        app_logger.error(f"Ошибка миграции CRS: {e}")
 
 migrate_crs()
 
@@ -159,7 +169,6 @@ async def get_full_image(date: str, layer: str):
             # Читаем все каналы (1 или 3)
             if src.count == 1:
                 data = src.read(1)
-                # Нормализация
                 if src.nodata is not None:
                     data = np.where(data == src.nodata, np.nan, data)
                 data = np.nan_to_num(data, nan=0.0)
@@ -169,16 +178,18 @@ async def get_full_image(date: str, layer: str):
                     data = np.zeros_like(data, dtype=np.uint8)
                 img = Image.fromarray(data, mode='L').convert('RGB')
             elif src.count >= 3:
-                data = src.read([1, 2, 3])
-                data = data.astype(np.float32)
+                data = src.read([1, 2, 3]).astype(np.float32)
                 if src.nodata is not None:
                     data = np.where(data == src.nodata, np.nan, data)
                 data = np.nan_to_num(data, nan=0.0)
-                dmin, dmax = data.min(), data.max()
-                if dmax - dmin > 1e-6:
-                    data = (data - dmin) / (dmax - dmin) * 255
-                else:
-                    data = np.zeros_like(data)
+                # Нормализация каждого канала отдельно
+                for i in range(3):
+                    ch = data[i]
+                    ch_min, ch_max = ch.min(), ch.max()
+                    if ch_max - ch_min > 1e-6:
+                        data[i] = (ch - ch_min) / (ch_max - ch_min) * 255
+                    else:
+                        data[i] = np.zeros_like(ch)
                 data = data.astype(np.uint8)
                 data = np.moveaxis(data, 0, -1)  # (H, W, 3)
                 img = Image.fromarray(data, mode='RGB')
@@ -191,7 +202,6 @@ async def get_full_image(date: str, layer: str):
                 new_size = (int(img.width * ratio), int(img.height * ratio))
                 img = img.resize(new_size, Image.Resampling.BILINEAR)
             
-            # Сохраняем в PNG (прозрачность не нужна)
             img_bytes = io.BytesIO()
             img.save(img_bytes, format='PNG')
             img_bytes.seek(0)
@@ -204,7 +214,14 @@ async def get_full_image(date: str, layer: str):
 async def get_layer_statistics(date: str, layer: str):
     stats = database.get_statistics_for_layer(date, layer)
     if not stats:
-        raise HTTPException(status_code=404, detail="Statistics not found")
+        # Возвращаем пустую статистику вместо 404
+        return {
+            "min": None,
+            "max": None,
+            "mean": None,
+            "stddev": None,
+            "histogram": None
+        }
     return stats
 
 @app.post("/api/compare")
@@ -238,6 +255,7 @@ async def get_map(request: Request):
         "map_height_mobile": MAP_HEIGHT_MOBILE,
         "controls_padding": CONTROLS_PADDING,
         "default_opacity": DEFAULT_OPACITY / 100.0,
+        "default_opacity_percent": DEFAULT_OPACITY,
         "default_map_zoom": DEFAULT_MAP_ZOOM,
         "default_map_center": DEFAULT_MAP_CENTER,
         "enable_compare": ENABLE_COMPARE,

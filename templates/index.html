@@ -18,7 +18,7 @@
         .container {
             max-width: 1400px;
             margin: 0 auto;
-            background: rgba(255,255,255,0.1);
+            background: rgba(0,0,0,0.1);
             border-radius: 20px;
             backdrop-filter: blur(10px);
             box-shadow: 0 8px 32px rgba(0,0,0,0.2);
@@ -95,7 +95,7 @@
         </div>
         <div class="control-group">
             <label>Прозрачность</label>
-            <input type="range" id="opacity-slider" min="0" max="100" value="{{ default_opacity * 100 }}">
+            <input type="range" id="opacity-slider" min="0" max="100" value="{{ default_opacity_percent }}">
         </div>
         <button id="apply-btn">Отобразить</button>
     </div>
@@ -129,6 +129,7 @@
     }).addTo(map);
 
     let currentOverlay = null;
+    let currentImageRequest = null;
 
     const dateSelect = document.getElementById('date-select');
     const layerSelect = document.getElementById('layer-select');
@@ -166,9 +167,13 @@
         const layer = layerSelect.value;
         if (!date || !layer) return;
         
+        // Отменяем предыдущий запрос, если он ещё выполняется
+        if (currentImageRequest) {
+            currentImageRequest.abort();
+        }
+        
         loader.style.display = 'block';
         try {
-            // Получаем информацию о слое (границы)
             const layersRes = await fetch(`/api/layers/${date}`);
             const layers = await layersRes.json();
             const layerInfo = layers.find(l => l.layer === layer);
@@ -176,31 +181,39 @@
             const boundsWGS84 = layerInfo.bounds; // [west, south, east, north]
             const imageBounds = [[boundsWGS84[1], boundsWGS84[0]], [boundsWGS84[3], boundsWGS84[2]]];
             
-            // Удаляем старый слой
             if (currentOverlay) map.removeLayer(currentOverlay);
             
-            // Загружаем изображение
+            const controller = new AbortController();
+            currentImageRequest = controller;
             const imageUrl = `/api/image/${date}/${layer}`;
+            const img = new Image();
+            img.crossOrigin = "Anonymous";
+            
+            const imageLoadPromise = new Promise((resolve, reject) => {
+                img.onload = () => resolve(img);
+                img.onerror = () => reject(new Error('Не удалось загрузить изображение'));
+                img.src = imageUrl;
+            });
+            
+            await imageLoadPromise;
             currentOverlay = L.imageOverlay(imageUrl, imageBounds, {
                 opacity: opacitySlider.value / 100,
                 interactive: true
             }).addTo(map);
             
-            // Автоматически центрируем карту по границам изображения
             map.fitBounds(imageBounds);
         } catch (err) {
-            console.error(err);
-            alert('Ошибка загрузки изображения: ' + err.message);
+            if (err.name !== 'AbortError') {
+                console.error(err);
+                alert('Ошибка загрузки изображения: ' + err.message);
+            }
         } finally {
+            if (currentImageRequest === controller) currentImageRequest = null;
             loader.style.display = 'none';
         }
     }
 
     dateSelect.addEventListener('change', (e) => loadLayers(e.target.value, layerSelect));
-    layerSelect.addEventListener('change', () => {
-        // Опционально: автоматически загружать изображение при выборе слоя
-        // loadImage();
-    });
     applyBtn.addEventListener('click', loadImage);
     opacitySlider.addEventListener('input', () => {
         if (currentOverlay) currentOverlay.setOpacity(opacitySlider.value / 100);
