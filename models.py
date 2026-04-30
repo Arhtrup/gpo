@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from datetime import date
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Any
 
 class SatelliteImageInfo(BaseModel):
     filename: str
@@ -12,6 +12,8 @@ class SatelliteImageInfo(BaseModel):
     crs: Optional[str] = None
     width: Optional[int] = None
     height: Optional[int] = None
+    transform: Optional[Any] = None  # Добавляем трансформацию
+    is_rotated: Optional[bool] = False  # Флаг поворота
     min_value: Optional[float] = None
     max_value: Optional[float] = None
     mean_value: Optional[float] = None

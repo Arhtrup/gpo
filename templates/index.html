@@ -212,43 +212,51 @@
         if (currentImageRequest) {
             currentImageRequest.abort();
         }
-        let controller;
+        
         showLoader();
         try {
             const layersRes = await fetch(`/api/layers/${date}`);
             const layers = await layersRes.json();
             const layerInfo = layers.find(l => l.layer === layer);
             if (!layerInfo) throw new Error('Слой не найден');
-            const boundsWGS84 = layerInfo.bounds;
-            const imageBounds = [[boundsWGS84[1], boundsWGS84[0]], [boundsWGS84[3], boundsWGS84[2]]];
             
             if (currentOverlay) map.removeLayer(currentOverlay);
             
             const controller = new AbortController();
             currentImageRequest = controller;
-            const imageUrl = `/api/image/${date}/${layer}`;
-            const img = new Image();
-            img.crossOrigin = "Anonymous";
             
-            await new Promise((resolve, reject) => {
-                img.onload = () => resolve(img);
-                img.onerror = () => reject(new Error('Не удалось загрузить изображение'));
-                img.src = imageUrl;
-            });
+            const response = await fetch(`/api/image/${date}/${layer}`);
+            const data = await response.json();
             
-            currentOverlay = L.imageOverlay(imageUrl, imageBounds, {
-                opacity: opacitySlider.value / 100,
-                interactive: true
-            }).addTo(map);
-            
-            map.fitBounds(imageBounds);
+            if (data.image && data.bounds) {
+                const imageBounds = [[data.bounds[1], data.bounds[0]], [data.bounds[3], data.bounds[2]]];
+                
+                // Создаем элемент img для загрузки
+                const img = new Image();
+                img.crossOrigin = "Anonymous";
+                
+                await new Promise((resolve, reject) => {
+                    img.onload = () => resolve(img);
+                    img.onerror = () => reject(new Error('Не удалось загрузить изображение'));
+                    img.src = data.image;
+                });
+                
+                currentOverlay = L.imageOverlay(data.image, imageBounds, {
+                    opacity: opacitySlider.value / 100,
+                    interactive: true
+                }).addTo(map);
+                
+                map.fitBounds(imageBounds);
+            } else {
+                throw new Error('Неверный формат ответа от сервера');
+            }
         } catch (err) {
             if (err.name !== 'AbortError') {
                 console.error(err);
                 alert('Ошибка загрузки изображения: ' + err.message);
             }
         } finally {
-            if (currentImageRequest === controller) currentImageRequest = null;
+            if (currentImageRequest) currentImageRequest = null;
             hideLoader();
         }
     }

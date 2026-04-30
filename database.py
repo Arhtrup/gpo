@@ -23,7 +23,9 @@ def init_db():
                 mean_value REAL,
                 stddev REAL,
                 bounds_wgs84 TEXT,
-                histogram TEXT
+                histogram TEXT,
+                transform TEXT,
+                is_rotated INTEGER
             )
         ''')
         existing_columns = [col[1] for col in c.execute("PRAGMA table_info(images)")]
@@ -31,7 +33,8 @@ def init_db():
         for col, col_type in [('crs', 'TEXT'), ('width', 'INTEGER'), ('height', 'INTEGER'),
                               ('min_value', 'REAL'), ('max_value', 'REAL'),
                               ('mean_value', 'REAL'), ('stddev', 'REAL'),
-                              ('bounds_wgs84', 'TEXT'), ('histogram', 'TEXT')]:
+                              ('bounds_wgs84', 'TEXT'), ('histogram', 'TEXT'),
+                              ('transform', 'TEXT'), ('is_rotated', 'INTEGER')]:  # Добавляем новые колонки
             if col not in existing_columns:
                 c.execute(f"ALTER TABLE images ADD COLUMN {col} {col_type}")
                 added += 1
@@ -42,6 +45,40 @@ def init_db():
     except Exception as e:
         app_logger.error(f"Ошибка инициализации БД: {e}", exc_info=True)
         raise
+    finally:
+        conn.close()
+
+def add_image(info: SatelliteImageInfo):
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        c = conn.cursor()
+        
+        # Сохраняем трансформацию как JSON
+        transform_json = None
+        if info.transform:
+            # Преобразуем аффинную трансформацию в список
+            transform_list = [info.transform.a, info.transform.b, info.transform.c,
+                            info.transform.d, info.transform.e, info.transform.f]
+            transform_json = json.dumps(transform_list)
+        
+        c.execute(
+            """INSERT OR REPLACE INTO images 
+               (filename, date, layer_type, bounds, tile_id, crs, width, height,
+                min_value, max_value, mean_value, stddev, bounds_wgs84, histogram,
+                transform, is_rotated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (info.filename, info.date.isoformat(), info.layer_type, json.dumps(info.bounds), info.tile_id,
+             info.crs, info.width, info.height,
+             info.min_value, info.max_value, info.mean_value, info.stddev,
+             json.dumps(info.bounds_wgs84) if info.bounds_wgs84 else None,
+             json.dumps(info.histogram) if info.histogram else None,
+             transform_json,
+             1 if info.is_rotated else 0)
+        )
+        conn.commit()
+        app_logger.debug(f"Добавлена/обновлена запись: {info.filename}")
+    except Exception as e:
+        app_logger.error(f"Ошибка добавления изображения {info.filename}: {e}", exc_info=True)
     finally:
         conn.close()
 
