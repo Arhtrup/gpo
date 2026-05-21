@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{{ web_title }}</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: {{ color_background }};
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: rgba(0,0,0,0.1);
+            border-radius: 20px;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+            overflow: hidden;
+        }
+        .controls {
+            padding: {{ controls_padding }};
+            background: {{ color_controls_bg }};
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            align-items: flex-end;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        .control-group { display: flex; flex-direction: column; gap: 8px; }
+        label { color: {{ color_text_light }}; font-size: 0.9rem; font-weight: 500; }
+        select {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: none;
+            background: {{ color_select_bg }};
+            min-width: 150px;
+            cursor: pointer;
+        }
+        button {
+            padding: 8px 20px;
+            border-radius: 8px;
+            border: none;
+            background: {{ color_button }};
+            color: white;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        button:hover { background: {{ color_button_hover }}; }
+        #map { height: {{ map_height }}; width: 100%; background: #111; }
+        
+        .stats-panel {
+            padding: 20px;
+            color: white;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        .stats-card {
+            background: rgba(255,255,255,0.05);
+            padding: 15px;
+            border-radius: 12px;
+        }
+        .loader {
+            display: none;
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0,0,0,0.8);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 8px;
+            z-index: 1000;
+        }
+        .area-info {
+            color: white;
+            font-size: 0.8rem;
+            background: rgba(0,0,0,0.5);
+            padding: 5px 10px;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="controls">
+        <div class="control-group">
+            <label>Дата</label>
+            <select id="date-select"><option value="">Выберите дату</option></select>
+        </div>
+        <div class="control-group">
+            <label>Слой</label>
+            <select id="layer-select"><option value="">Выберите слой</option></select>
+        </div>
+        <div class="control-group">
+            <label>Прозрачность</label>
+            <input type="range" id="opacity-slider" min="0" max="100" value="{{ default_opacity_percent }}">
+        </div>
+        <button id="apply-btn">Отобразить</button>
+    </div>
+
+    <div id="map"></div>
+
+    {% if enable_compare %}
+    <div class="controls">
+        <div class="control-group">
+            <label>Сравнение 1</label>
+            <select id="compare-date-1"><option value="">Дата 1</option></select>
+            <select id="compare-layer-1"><option value="">Слой 1</option></select>
+        </div>
+        <div class="control-group">
+            <label>Сравнение 2</label>
+            <select id="compare-date-2"><option value="">Дата 2</option></select>
+            <select id="compare-layer-2"><option value="">Слой 2</option></select>
+        </div>
+        <button id="compare-btn">Сравнить статистику</button>
+    </div>
+    <div id="compare-results" class="stats-panel"></div>
+
+    <div class="controls">
+        <div class="control-group">
+            <label>Сравнение по области</label>
+            <button id="select-area-btn" style="background: #ff9800;">Выбрать область</button>
+            <button id="clear-area-btn" style="background: #f44336;">Очистить</button>
+        </div>
+        <div id="area-info" class="area-info"></div>
+    </div>
+    <div id="compare-area-results" class="stats-panel" style="display: none;"></div>
+    {% endif %}
+</div>
+<div class="loader" id="loader">Загрузка...</div>
+
+<script>
+    const map = L.map('map', {attributionControl: false}).setView({{ default_map_center }}, {{ default_map_zoom }});  
+    L.tileLayer('{{ default_base_tile_url }}', {
+        attribution: '{{ default_base_attribution }}',
+        maxZoom: {{ default_base_max_zoom }}
+    }).addTo(map);
+
+    let currentOverlay = null;
+    let currentImageRequest = null;
+    let drawControl = null;
+    let drawnItems = null;
+    let selectedBbox = null;
+
+    const dateSelect = document.getElementById('date-select');
+    const layerSelect = document.getElementById('layer-select');
+    const opacitySlider = document.getElementById('opacity-slider');
+    const applyBtn = document.getElementById('apply-btn');
+    const loader = document.getElementById('loader');
+
+    function showLoader() { loader.style.display = 'block'; }
+    function hideLoader() { loader.style.display = 'none'; }
+
+    async function loadDates() {
+        showLoader();
+        try {
+            const res = await fetch('/api/dates');
+            const dates = await res.json();
+            dates.forEach(date => {
+                const opt = new Option(date, date);
+                dateSelect.add(opt);
+                {% if enable_compare %}
+                document.getElementById('compare-date-1').add(new Option(date, date));
+                document.getElementById('compare-date-2').add(new Option(date, date));
+                {% endif %}
+            });
+        } catch (err) {
+            console.error(err);
+            alert('Ошибка загрузки дат');
+        } finally {
+            hideLoader();
+        }
+    }
+
+    async function loadLayers(date, selectElement) {
+        if (!date) return;
+        showLoader();
+        try {
+            const res = await fetch(`/api/layers/${date}`);
+            const layers = await res.json();
+            selectElement.innerHTML = '<option value="">Выберите слой</option>';
+            layers.forEach(l => {
+                const opt = new Option(l.layer, l.layer);
+                opt.dataset.bounds = JSON.stringify(l.bounds);
+                opt.dataset.label = l.label;
+                selectElement.add(opt);
+            });
+        } catch (err) {
+            console.error(err);
+            alert('Ошибка загрузки слоёв');
+        } finally {
+            hideLoader();
+        }
+    }
+
+    async function loadImage() {
+        const date = dateSelect.value;
+        const layer = layerSelect.value;
+        if (!date || !layer) return;
+        
+        if (currentImageRequest) {
+            currentImageRequest.abort();
+        }
+        
+        showLoader();
+        try {
+            const layersRes = await fetch(`/api/layers/${date}`);
+            const layers = await layersRes.json();
+            const layerInfo = layers.find(l => l.layer === layer);
+            if (!layerInfo) throw new Error('Слой не найден');
+            
+            if (currentOverlay) map.removeLayer(currentOverlay);
+            
+            const controller = new AbortController();
+            currentImageRequest = controller;
+            
+            const response = await fetch(`/api/image/${date}/${layer}`);
+            const data = await response.json();
+            
+            if (data.image && data.bounds) {
+                const imageBounds = [[data.bounds[1], data.bounds[0]], [data.bounds[3], data.bounds[2]]];
+                
+                // Создаем элемент img для загрузки
+                const img = new Image();
+                img.crossOrigin = "Anonymous";
+                
+                await new Promise((resolve, reject) => {
+                    img.onload = () => resolve(img);
+                    img.onerror = () => reject(new Error('Не удалось загрузить изображение'));
+                    img.src = data.image;
+                });
+                
+                currentOverlay = L.imageOverlay(data.image, imageBounds, {
+                    opacity: opacitySlider.value / 100,
+                    interactive: true
+                }).addTo(map);
+                
+                map.fitBounds(imageBounds);
+            } else {
+                throw new Error('Неверный формат ответа от сервера');
+            }
+        } catch (err) {
+            if (err.name !== 'AbortError') {
+                console.error(err);
+                alert('Ошибка загрузки изображения: ' + err.message);
+            }
+        } finally {
+            if (currentImageRequest) currentImageRequest = null;
+            hideLoader();
+        }
+    }
+
+    dateSelect.addEventListener('change', (e) => loadLayers(e.target.value, layerSelect));
+    applyBtn.addEventListener('click', loadImage);
+    opacitySlider.addEventListener('input', () => {
+        if (currentOverlay) currentOverlay.setOpacity(opacitySlider.value / 100);
+    });
+
+    loadDates();
+
+    {% if enable_compare %}
+    const compareDate1 = document.getElementById('compare-date-1');
+    const compareLayer1 = document.getElementById('compare-layer-1');
+    const compareDate2 = document.getElementById('compare-date-2');
+    const compareLayer2 = document.getElementById('compare-layer-2');
+    const compareBtn = document.getElementById('compare-btn');
+    const compareResults = document.getElementById('compare-results');
+
+    compareDate1.addEventListener('change', (e) => loadLayers(e.target.value, compareLayer1));
+    compareDate2.addEventListener('change', (e) => loadLayers(e.target.value, compareLayer2));
+
+    async function performCompare() {
+        const date1 = compareDate1.value;
+        const layer1 = compareLayer1.value;
+        const date2 = compareDate2.value;
+        const layer2 = compareLayer2.value;
+        if (!date1 || !layer1 || !date2 || !layer2) {
+            alert('Пожалуйста, выберите обе пары (дата + слой)');
+            return;
+        }
+        showLoader();
+        try {
+            const response = await fetch('/api/compare', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ date1, layer1, date2, layer2 })
+            });
+            const data = await response.json();
+            compareResults.innerHTML = '';
+            
+            // Карточка 1
+            const card1 = document.createElement('div');
+            card1.className = 'stats-card';
+            card1.innerHTML = `
+                <h3> ${data.layer1.label}</h3>
+                <p><strong>Дата:</strong> ${data.layer1.date}</p>
+                <hr style="margin: 10px 0; opacity: 0.3;">
+                <p><strong>Минимальное значение:</strong> ${data.layer1.statistics.min?.toFixed(4) ?? '—'}</p>
+                <p><strong>Максимальное значение:</strong> ${data.layer1.statistics.max?.toFixed(4) ?? '—'}</p>
+                <p><strong>Среднее значение:</strong> ${data.layer1.statistics.mean?.toFixed(4) ?? '—'}</p>
+                <p><strong>Стандартное отклонение:</strong> ${data.layer1.statistics.stddev?.toFixed(4) ?? '—'}</p>
+            `;
+            
+            // Карточка 2
+            const card2 = document.createElement('div');
+            card2.className = 'stats-card';
+            card2.innerHTML = `
+                <h3>${data.layer2.label}</h3>
+                <p><strong>Дата:</strong> ${data.layer2.date}</p>
+                <hr style="margin: 10px 0; opacity: 0.3;">
+                <p><strong>Минимальное значение:</strong> ${data.layer2.statistics.min?.toFixed(4) ?? '—'}</p>
+                <p><strong>Максимальное значение:</strong> ${data.layer2.statistics.max?.toFixed(4) ?? '—'}</p>
+                <p><strong>Среднее значение:</strong> ${data.layer2.statistics.mean?.toFixed(4) ?? '—'}</p>
+                <p><strong>Стандартное отклонение:</strong> ${data.layer2.statistics.stddev?.toFixed(4) ?? '—'}</p>
+            `;
+            
+            // Карточка изменений (если есть данные)
+            if (data.changes && data.changes.mean_change !== undefined) {
+                const changesCard = document.createElement('div');
+                changesCard.className = 'stats-card';
+                changesCard.style.gridColumn = '1 / -1';
+                changesCard.style.background = 'rgba(255, 165, 0, 0.15)';
+                
+                const changeColor = data.changes.mean_change >= 0 ? '#4caf50' : '#f44336';
+                const changeSign = data.changes.mean_change >= 0 ? '+' : '';
+                
+                changesCard.innerHTML = `
+                    <h3 style="color: #ff9800;">Изменения между слоями</h3>
+                    <p><strong>Изменение среднего значения:</strong> 
+                    <span style="color: ${changeColor}; font-weight: bold;">
+                        ${changeSign}${data.changes.mean_change.toFixed(4)}
+                    </span>
+                    </p>
+                    <p><strong>Изменение среднего (%):</strong> 
+                    <span style="color: ${changeColor}; font-weight: bold;">
+                        ${changeSign}${data.changes.mean_change_percent.toFixed(2)}%
+                    </span>
+                    </p>
+                    <p><strong>Изменение минимума:</strong> 
+                    <span style="color: ${data.changes.min_change >= 0 ? '#4caf50' : '#f44336'};">
+                        ${data.changes.min_change?.toFixed(4) ?? '—'}
+                    </span>
+                    </p>
+                    <p><strong>Изменение максимума:</strong> 
+                    <span style="color: ${data.changes.max_change >= 0 ? '#4caf50' : '#f44336'};">
+                        ${data.changes.max_change?.toFixed(4) ?? '—'}
+                    </span>
+                    </p>
+                    <hr style="margin: 10px 0; opacity: 0.3;">
+                    <p style="font-size: 0.9rem; opacity: 0.8;">
+                        <strong>Пояснения:</strong><br>
+                        • <strong>Среднее значение</strong> - показывает общую интенсивность показателя на всей территории<br>
+                        • <strong>Стандартное отклонение</strong> - показывает разнородность территории (чем выше, тем больше различий)<br>
+                        • <strong>Минимум/Максимум</strong> - крайние значения показателя<br>
+                        • <strong>Положительное изменение</strong> - увеличение показателя со временем
+                    </p>
+                `;
+                
+                compareResults.appendChild(card1);
+                compareResults.appendChild(card2);
+                compareResults.appendChild(changesCard);
+            } else {
+                compareResults.appendChild(card1);
+                compareResults.appendChild(card2);
+                
+                // Добавляем пояснительную карточку
+                const infoCard = document.createElement('div');
+                infoCard.className = 'stats-card';
+                infoCard.style.gridColumn = '1 / -1';
+                infoCard.style.background = 'rgba(33, 150, 243, 0.1)';
+                infoCard.innerHTML = `
+                    <h3 style="color: #2196f3;">ℹЧто означают эти показатели?</h3>
+                    <p><strong>Минимальное значение</strong> - наименьший показатель на снимке</p>
+                    <p><strong>Максимальное значение</strong> - наибольший показатель на снимке</p>
+                    <p><strong>Среднее значение</strong> - средний показатель по всей территории</p>
+                    <p><strong>Стандартное отклонение</strong> - показывает, насколько территория разнородна по данному показателю</p>
+                    <p style="margin-top: 10px; font-size: 0.85rem; opacity: 0.7;">💡 Для вегетационных индексов (NDVI): чем выше значение, тем более здоровая растительность</p>
+                `;
+                compareResults.appendChild(infoCard);
+            }
+            
+            // Добавляем гистограммы если включены
+            if ({{ show_histograms | lower }}) {
+                if (data.layer1.statistics.histogram && data.layer1.statistics.histogram.length) {
+                    const canvas1 = document.createElement('canvas');
+                    canvas1.width = 300;
+                    canvas1.height = 150;
+                    canvas1.style.maxWidth = '100%';
+                    canvas1.style.marginTop = '10px';
+                    card1.appendChild(document.createElement('hr'));
+                    card1.appendChild(canvas1);
+                    new Chart(canvas1, {
+                        type: 'bar',
+                        data: { 
+                            labels: Array(data.layer1.statistics.histogram.length).fill(''), 
+                            datasets: [{ 
+                                label: 'Распределение значений', 
+                                data: data.layer1.statistics.histogram, 
+                                backgroundColor: 'rgba(75,192,192,0.4)',
+                                borderColor: 'rgba(75,192,192,1)',
+                                borderWidth: 1
+                            }] 
+                        },
+                        options: { 
+                            responsive: true, 
+                            maintainAspectRatio: true, 
+                            plugins: { 
+                                legend: { labels: { color: 'white' } },
+                                tooltip: { callbacks: { label: (ctx) => `Частота: ${ctx.raw}` } }
+                            } 
+                        }
+                    });
+                }
+                
+                if (data.layer2.statistics.histogram && data.layer2.statistics.histogram.length) {
+                    const canvas2 = document.createElement('canvas');
+                    canvas2.width = 300;
+                    canvas2.height = 150;
+                    canvas2.style.maxWidth = '100%';
+                    canvas2.style.marginTop = '10px';
+                    card2.appendChild(document.createElement('hr'));
+                    card2.appendChild(canvas2);
+                    new Chart(canvas2, {
+                        type: 'bar',
+                        data: { 
+                            labels: Array(data.layer2.statistics.histogram.length).fill(''), 
+                            datasets: [{ 
+                                label: 'Распределение значений', 
+                                data: data.layer2.statistics.histogram, 
+                                backgroundColor: 'rgba(153,102,255,0.4)',
+                                borderColor: 'rgba(153,102,255,1)',
+                                borderWidth: 1
+                            }] 
+                        },
+                        options: { 
+                            responsive: true, 
+                            maintainAspectRatio: true, 
+                            plugins: { 
+                                legend: { labels: { color: 'white' } },
+                                tooltip: { callbacks: { label: (ctx) => `Частота: ${ctx.raw}` } }
+                            } 
+                        }
+                    });
+                }
+            }
+            
+        } catch (err) {
+            console.error(err);
+            compareResults.innerHTML = '<div class="stats-card" style="grid-column: 1/-1; color: #f44336;">❌ Ошибка загрузки данных сравнения</div>';
+        } finally {
+            hideLoader();
+        }
+    }
+    compareBtn.addEventListener('click', performCompare);
+
+    // Сравнение по области
+    const selectAreaBtn = document.getElementById('select-area-btn');
+    const clearAreaBtn = document.getElementById('clear-area-btn');
+    const areaInfoDiv = document.getElementById('area-info');
+    const compareAreaResults = document.getElementById('compare-area-results');
+
+    function enableAreaSelection() {
+        if (drawnItems) map.removeLayer(drawnItems);
+        drawnItems = L.featureGroup().addTo(map);
+        drawControl = new L.Draw.Rectangle(map, {
+            shapeOptions: { color: '#ff9800', weight: 2 }
+        });
+        drawControl.enable();
+        
+        map.once('draw:created', function(e) {
+            const layer = e.layer;
+            drawnItems.addLayer(layer);
+            const bounds = layer.getBounds();
+            const west = bounds.getWest();
+            const south = bounds.getSouth();
+            const east = bounds.getEast();
+            const north = bounds.getNorth();
+            selectedBbox = [west, south, east, north];
+            areaInfoDiv.innerHTML = `Область: ${west.toFixed(4)}, ${south.toFixed(4)} - ${east.toFixed(4)}, ${north.toFixed(4)}`;
+            if (drawControl) drawControl.disable();
+            // автоматически сравнить, если выбраны слои
+            const date1 = compareDate1.value;
+            const layer1 = compareLayer1.value;
+            const date2 = compareDate2.value;
+            const layer2 = compareLayer2.value;
+            if (date1 && layer1 && date2 && layer2) {
+                performAreaCompare();
+            }
+        });
+    }
+
+    function clearArea() {
+        if (drawnItems) map.removeLayer(drawnItems);
+        if (drawControl) drawControl.disable();
+        selectedBbox = null;
+        areaInfoDiv.innerHTML = '';
+        compareAreaResults.style.display = 'none';
+    }
+
+    async function performAreaCompare() {
+        const date1 = compareDate1.value;
+        const layer1 = compareLayer1.value;
+        const date2 = compareDate2.value;
+        const layer2 = compareLayer2.value;
+        
+        if (!date1 || !layer1 || !date2 || !layer2) {
+            alert('Выберите обе пары (дата + слой) для сравнения');
+            return;
+        }
+        if (!selectedBbox) {
+            alert('Сначала выберите область на карте');
+            return;
+        }
+        
+        showLoader();
+        try {
+            const response = await fetch('/api/compare-area', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    date1, layer1, date2, layer2,
+                    bbox: selectedBbox
+                })
+            });
+            
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            
+            const data = await response.json();
+            console.log('Данные от сервера:', data); // Для отладки
+            
+            // Проверяем наличие необходимых данных
+            if (!data.layer1_stats || !data.layer2_stats) {
+                throw new Error('Неполные данные от сервера');
+            }
+            
+            const changeColor = (data.changes && data.changes.mean_change !== undefined) 
+                ? (data.changes.mean_change >= 0 ? '#4caf50' : '#f44336') 
+                : '#ff9800';
+            const changeSign = (data.changes && data.changes.mean_change !== undefined && data.changes.mean_change >= 0) ? '+' : '';
+            
+            // Безопасное форматирование чисел
+            const formatNumber = (num) => num !== undefined && num !== null ? num.toFixed(4) : '—';
+            
+            compareAreaResults.innerHTML = `
+                <div class="stats-card" style="grid-column: 1/-1;">
+                    <h3 style="color: #ff9800;">Сравнение областей</h3>
+                    <p><strong>Выбранная область:</strong> ${areaInfoDiv.innerHTML}</p>
+                    <hr style="margin: 10px 0; opacity: 0.3;">
+                    
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                        <div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 8px;">
+                            <h4>${layer1} (${date1})</h4>
+                            <p>Минимум: ${formatNumber(data.layer1_stats.min)}</p>
+                            <p>Максимум: ${formatNumber(data.layer1_stats.max)}</p>
+                            <p>Среднее: ${formatNumber(data.layer1_stats.mean)}</p>
+                            <p>Стандартное отклонение: ${formatNumber(data.layer1_stats.stddev)}</p>
+                            ${data.images && data.images.layer1 ? `<img src="${data.images.layer1}" style="width: 100%; margin-top: 10px; border-radius: 4px;" />` : ''}
+                        </div>
+                        <div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 8px;">
+                            <h4>${layer2} (${date2})</h4>
+                            <p>Минимум: ${formatNumber(data.layer2_stats.min)}</p>
+                            <p>Максимум: ${formatNumber(data.layer2_stats.max)}</p>
+                            <p>Среднее: ${formatNumber(data.layer2_stats.mean)}</p>
+                            <p>Стандартное отклонение: ${formatNumber(data.layer2_stats.stddev)}</p>
+                            ${data.images && data.images.layer2 ? `<img src="${data.images.layer2}" style="width: 100%; margin-top: 10px; border-radius: 4px;" />` : ''}
+                        </div>
+                    </div>
+                    
+                    ${data.changes ? `
+                    <div style="background: rgba(255, 165, 0, 0.15); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                        <h4 style="color: #ff9800;">Изменения между слоями</h4>
+                        ${data.changes.mean_change !== undefined ? `<p>Изменение среднего: <span style="color: ${changeColor}; font-weight: bold;">${changeSign}${data.changes.mean_change.toFixed(4)}</span></p>` : ''}
+                        ${data.changes.mean_change_percent !== undefined ? `<p>Изменение среднего (%): <span style="color: ${changeColor}; font-weight: bold;">${changeSign}${data.changes.mean_change_percent.toFixed(2)}%</span></p>` : ''}
+                        <p>Изменение минимума: <span style="color: ${(data.layer2_stats.min - data.layer1_stats.min) >= 0 ? '#4caf50' : '#f44336'};">${(data.layer2_stats.min - data.layer1_stats.min).toFixed(4)}</span></p>
+                        <p>Изменение максимума: <span style="color: ${(data.layer2_stats.max - data.layer1_stats.max) >= 0 ? '#4caf50' : '#f44336'};">${(data.layer2_stats.max - data.layer1_stats.max).toFixed(4)}</span></p>
+                    </div>
+                    ` : ''}
+                    
+                    <div style="margin-top: 15px;">
+                        <h4>Карта разницы</h4>
+                        <p><small>Чем ярче область, тем больше разница между снимками</small></p>
+                        ${data.images && data.images.diff ? `<img src="${data.images.diff}" style="width: 100%; border-radius: 8px; border: 1px solid #ccc;" />` : ''}
+                        ${data.statistics && data.statistics.histogram ? '<canvas id="diff-histogram" width="300" height="150" style="max-width:100%; margin-top: 10px;"></canvas>' : ''}
+                    </div>
+                    
+                    <hr style="margin: 15px 0; opacity: 0.3;">
+                    <div style="font-size: 0.85rem; opacity: 0.8; background: rgba(33, 150, 243, 0.1); padding: 10px; border-radius: 8px;">
+                        <strong>Пояснения:</strong><br>
+                        • <strong>Среднее значение</strong> - средний показатель на выбранной области<br>
+                        • <strong>Стандартное отклонение</strong> - показывает однородность области<br>
+                        • <strong>Положительное изменение</strong> - увеличение показателя со временем<br>
+                        • <strong>Карта разницы</strong> - визуализация различий между снимками
+                    </div>
+                </div>
+            `;
+            
+            // Создаем гистограмму если есть данные
+            if (data.statistics && data.statistics.histogram && data.statistics.histogram.length) {
+                const ctx = document.getElementById('diff-histogram').getContext('2d');
+                new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: Array(data.statistics.histogram.length).fill(''),
+                        datasets: [{ 
+                            label: 'Распределение разницы', 
+                            data: data.statistics.histogram, 
+                            backgroundColor: 'rgba(255,99,132,0.4)',
+                            borderColor: 'rgba(255,99,132,1)',
+                            borderWidth: 1
+                        }]
+                    },
+                    options: { 
+                        responsive: true, 
+                        maintainAspectRatio: true, 
+                        plugins: { 
+                            legend: { labels: { color: 'white' } },
+                            tooltip: { callbacks: { label: (ctx) => `Частота: ${ctx.raw}` } }
+                        } 
+                    }
+                });
+            }
+            
+            compareAreaResults.style.display = 'grid';
+        } catch (err) {
+            console.error('Ошибка:', err);
+            compareAreaResults.innerHTML = `
+                <div class="stats-card" style="grid-column: 1/-1; color: #f44336;">
+                    <h3>Ошибка при сравнении областей</h3>
+                    <p>${err.message}</p>
+                    <p style="font-size: 0.85rem; margin-top: 10px;">Попробуйте выбрать другую область или проверьте, что оба слоя существуют для выбранных дат.</p>
+                </div>
+            `;
+            compareAreaResults.style.display = 'grid';
+        } finally {
+            hideLoader();
+        }
+    }
+
+    selectAreaBtn.addEventListener('click', enableAreaSelection);
+    clearAreaBtn.addEventListener('click', clearArea);
+    {% endif %}
+</script>
+</body>
+</html>

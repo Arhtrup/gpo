@@ -10,11 +10,13 @@ import rasterio
 from rasterio.warp import transform_bounds
 from rasterio.windows import Window
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter
 import math
 import io
 import base64
 import database
+from fastapi.responses import JSONResponse
+import base64
 from geotiff_parser import parse_geotiff_metadata, guess_crs_from_filename
 from logger import app_logger
 from settings import (
@@ -217,7 +219,6 @@ async def get_full_image(date: str, layer: str):
                 if src.nodata is not None:
                     data = np.where(data == src.nodata, np.nan, data)
                 
-                # Сохраняем маску валидных пикселей
                 valid_mask = ~np.isnan(data)
                 
                 data = np.nan_to_num(data, nan=0.0)
@@ -226,12 +227,9 @@ async def get_full_image(date: str, layer: str):
                 else:
                     data = np.zeros_like(data, dtype=np.uint8)
                 
-                # Создаем RGBA изображение (с альфа-каналом)
                 img = Image.fromarray(data, mode='L').convert('RGBA')
-                
-                # Устанавливаем прозрачность для невалидных пикселей
                 img_array = np.array(img)
-                img_array[~valid_mask, 3] = 0  # альфа-канал = 0 для невалидных
+                img_array[~valid_mask, 3] = 0
                 img = Image.fromarray(img_array, mode='RGBA')
                 
             elif src.count >= 3:
@@ -239,7 +237,6 @@ async def get_full_image(date: str, layer: str):
                 if src.nodata is not None:
                     data = np.where(data == src.nodata, np.nan, data)
                 
-                # Маска валидных пикселей (все каналы не NaN)
                 valid_mask = ~np.isnan(data).any(axis=0)
                 
                 data = np.nan_to_num(data, nan=0.0)
@@ -253,10 +250,7 @@ async def get_full_image(date: str, layer: str):
                 data = data.astype(np.uint8)
                 data = np.moveaxis(data, 0, -1)
                 
-                # Создаем RGBA изображение
                 img = Image.fromarray(data, mode='RGB').convert('RGBA')
-                
-                # Устанавливаем прозрачность для невалидных пикселей
                 img_array = np.array(img)
                 img_array[~valid_mask, 3] = 0
                 img = Image.fromarray(img_array, mode='RGBA')
@@ -282,6 +276,10 @@ async def get_full_image(date: str, layer: str):
             app_logger.info(f"Оригинальные границы WGS84: {original_bounds}")
             app_logger.info(f"Углы WGS84: {corners_geo}")
             app_logger.info(f"Расчётный угол поворота: {angle} градусов")
+            app_logger.info(f"Оригинальный размер изображения: {img.size}")
+            
+            # Запоминаем оригинальный размер
+            original_size = img.size
             
             # Применяем поворот, если необходимо
             if abs(angle) > 1.0 and abs(angle - 90) > 1.0 and abs(angle + 90) > 1.0:
@@ -289,14 +287,36 @@ async def get_full_image(date: str, layer: str):
                 
                 # Поворачиваем с expand=True, фон будет прозрачным
                 img = img.rotate(angle, expand=True, resample=Image.Resampling.BICUBIC)
+                app_logger.info(f"Размер после поворота: {img.size}")
                 
-                # Пересчитываем границы для повернутого изображения
-                # Создаем матрицу поворота
-                rad = math.radians(-angle)
-                cos_a = math.cos(rad)
-                sin_a = math.sin(rad)
+                # Обрезаем прозрачные края
+                alpha = np.array(img.getchannel("A"))
+                mask = alpha > 10
+
+                coords = np.argwhere(mask)
+
+                if coords.size > 0:
+                    y0, x0 = coords.min(axis=0)
+                    y1, x1 = coords.max(axis=0) + 1
+                    img = img.crop((x0, y0, x1, y1))
+                    app_logger.info(f"Размер после обрезки: {img.size}")
+                #if bbox:
+                #    img = img.crop(bbox)
+                #    app_logger.info(f"Размер после обрезки: {img.size}")
                 
-                # Центр оригинального изображения в градусах
+                # Масштабируем обратно до оригинального размера
+                if img.size != original_size:
+                    app_logger.info(f"resize from {img.size} to {original_size}")
+
+                    img = img.resize(
+                        original_size,
+                        Image.Resampling.BILINEAR
+                    )
+
+                    app_logger.info(f"after resize: {img.size}")
+                
+                # Пересчитываем границы для повернутого изображения с учетом центрирования
+                # Находим центр оригинального изображения
                 center_lon = (original_bounds[0] + original_bounds[2]) / 2
                 center_lat = (original_bounds[1] + original_bounds[3]) / 2
                 
@@ -304,7 +324,7 @@ async def get_full_image(date: str, layer: str):
                 half_width = (original_bounds[2] - original_bounds[0]) / 2
                 half_height = (original_bounds[3] - original_bounds[1]) / 2
                 
-                # Углы относительно центра (верхний-левый, верхний-правый, нижний-правый, нижний-левый)
+                # Углы относительно центра
                 corners_rel = [
                     (-half_width, -half_height),  # верхний-левый
                     ( half_width, -half_height),  # верхний-правый
@@ -313,6 +333,10 @@ async def get_full_image(date: str, layer: str):
                 ]
                 
                 # Поворачиваем углы
+                rad = math.radians(angle)
+                cos_a = math.cos(rad)
+                sin_a = math.sin(rad)
+                
                 rotated_corners = []
                 for x, y in corners_rel:
                     x_rot = x * cos_a - y * sin_a
@@ -328,52 +352,22 @@ async def get_full_image(date: str, layer: str):
                 ]
                 
                 app_logger.info(f"Новые границы после поворота: {new_bounds}")
-                
-                # Обрезаем пустые края (прозрачные области)
-                bbox = img.getbbox()
-                if bbox:
-                    img = img.crop(bbox)
-                    
-                    # Корректируем границы с учетом обрезки
-                    crop_left = bbox[0] / img.width
-                    crop_top = bbox[1] / img.height
-                    crop_right = bbox[2] / img.width
-                    crop_bottom = bbox[3] / img.height
-                    
-                    # Интерполируем новые границы на основе обрезки
-                    width_deg = new_bounds[2] - new_bounds[0]
-                    height_deg = new_bounds[3] - new_bounds[1]
-                    
-                    new_bounds = [
-                        new_bounds[0] + crop_left * width_deg,
-                        new_bounds[1] + crop_top * height_deg,
-                        new_bounds[0] + crop_right * width_deg,
-                        new_bounds[1] + crop_bottom * height_deg
-                    ]
-                    
-                    app_logger.info(f"Границы после обрезки: {new_bounds}")
-                
-                # Сохраняем новые границы в ответе
-                response_bounds = new_bounds
+                response_bounds = original_bounds
             else:
                 app_logger.info(f"Поворот не требуется (угол {angle} градусов)")
                 response_bounds = original_bounds
             
-            # Изменяем размер при необходимости
+            # Изменяем размер при необходимости (если превышает лимиты)
             if img.width > MAX_IMAGE_WIDTH or img.height > MAX_IMAGE_HEIGHT:
                 ratio = min(MAX_IMAGE_WIDTH / img.width, MAX_IMAGE_HEIGHT / img.height)
                 new_size = (int(img.width * ratio), int(img.height * ratio))
                 img = img.resize(new_size, Image.Resampling.BILINEAR)
+                app_logger.info(f"Размер после ресайза для лимитов: {img.size}")
             
             # Сохраняем изображение в bytes
             img_bytes = io.BytesIO()
             img.save(img_bytes, format='PNG')
             img_bytes.seek(0)
-            
-            # Возвращаем изображение и новые границы
-            # Используем StreamingResponse для изображения
-            from fastapi.responses import JSONResponse
-            import base64
             
             # Кодируем изображение в base64 для передачи вместе с границами
             img_base64 = base64.b64encode(img_bytes.getvalue()).decode('utf-8')
@@ -402,97 +396,221 @@ async def compare_layers(request: dict):
     layer2 = request.get("layer2")
     if not date1 or not layer1 or not date2 or not layer2:
         raise HTTPException(status_code=400, detail="Missing parameters")
+    
     stats1 = await get_layer_statistics(date1, layer1)
     stats2 = await get_layer_statistics(date2, layer2)
+    
+    # Вычисляем изменения между слоями
+    changes = {}
+    if stats1 and stats2 and stats1.get('mean') is not None and stats2.get('mean') is not None:
+        changes['mean_change'] = stats2['mean'] - stats1['mean']
+        changes['mean_change_percent'] = (changes['mean_change'] / stats1['mean']) * 100 if stats1['mean'] != 0 else 0
+        changes['min_change'] = stats2['min'] - stats1['min'] if stats1['min'] is not None else None
+        changes['max_change'] = stats2['max'] - stats1['max'] if stats1['max'] is not None else None
+    
     return {
-        "layer1": {"date": date1, "layer": layer1, "statistics": stats1, "label": LAYER_LABELS.get(layer1, layer1)},
-        "layer2": {"date": date2, "layer": layer2, "statistics": stats2, "label": LAYER_LABELS.get(layer2, layer2)}
+        "layer1": {
+            "date": date1, 
+            "layer": layer1, 
+            "statistics": stats1, 
+            "label": LAYER_LABELS.get(layer1, layer1)
+        },
+        "layer2": {
+            "date": date2, 
+            "layer": layer2, 
+            "statistics": stats2, 
+            "label": LAYER_LABELS.get(layer2, layer2)
+        },
+        "changes": changes
     }
 
 def extract_image_from_bbox(filepath, bbox_wgs84, target_size):
-    with rasterio.open(filepath) as src:
-        if not src.crs:
-            # Попробовать определить CRS из имени файла
-            base_filename = os.path.basename(filepath)
-            guessed_crs = guess_crs_from_filename(base_filename)
-            if guessed_crs:
-                from rasterio.crs import CRS
-                src.crs = CRS.from_string(guessed_crs)
-                app_logger.warning(f"Использован угаданный CRS для {filepath}: {guessed_crs}")
-            else:
-                # Если файл из зоны 45, используем стандартный CRS
-                if 'T45' in base_filename:
-                    from rasterio.crs import CRS
-                    src.crs = CRS.from_string("EPSG:32745")
-                    app_logger.warning(f"Принудительно установлен CRS EPSG:32745 для {filepath}")
-                else:
-                    raise ValueError(f"No CRS for {filepath} and could not guess from filename")
+    """Извлекает область изображения по WGS84 координатам"""
+    try:
+        app_logger.info(f"Извлечение области из {filepath}, bbox={bbox_wgs84}")
         
-        left, bottom, right, top = bbox_wgs84
-        bounds_src = transform_bounds("EPSG:4326", src.crs, left, bottom, right, top)
-        window = src.window(*bounds_src)
-        window = window.round_lengths().round_offsets()
-        window = window.intersection(Window(0, 0, src.width, src.height))
-        if window.width == 0 or window.height == 0:
-            return None
-        if src.count == 1:
-            data = src.read(1, window=window).astype(np.float32)
-        else:
-            data = src.read(window=window).astype(np.float32)
-            data = np.mean(data, axis=0)
-        if src.nodata is not None:
-            data = np.where(data == src.nodata, np.nan, data)
-        data = np.nan_to_num(data, nan=0.0)
-        dmin, dmax = data.min(), data.max()
-        if dmax - dmin > 1e-6:
-            data = ((data - dmin) / (dmax - dmin) * 255).astype(np.uint8)
-        else:
-            data = np.zeros_like(data, dtype=np.uint8)
-        if data.shape != target_size:
-            img = Image.fromarray(data)
-            img = img.resize(target_size, Image.Resampling.BILINEAR)
-            data = np.array(img)
-        return data
+        with rasterio.open(filepath) as src:
+            app_logger.info(f"Размер изображения: {src.width}x{src.height}, CRS={src.crs}")
+            
+            # Получаем CRS (не пытаемся его изменить!)
+            crs = src.crs
+            if not crs:
+                # Если CRS нет, пытаемся определить из имени файла
+                base_filename = os.path.basename(filepath)
+                guessed_crs = guess_crs_from_filename(base_filename)
+                if guessed_crs:
+                    from rasterio.crs import CRS
+                    crs = CRS.from_string(guessed_crs)
+                    app_logger.warning(f"Определен CRS из имени файла для {filepath}: {guessed_crs}")
+                else:
+                    if 'T45' in base_filename:
+                        from rasterio.crs import CRS
+                        crs = CRS.from_string("EPSG:32745")
+                        app_logger.warning(f"Принудительно установлен CRS EPSG:32745 для {filepath}")
+                    else:
+                        raise ValueError(f"No CRS for {filepath}")
+            else:
+                app_logger.info(f"Используем CRS из файла: {crs}")
+            
+            left, bottom, right, top = bbox_wgs84
+            app_logger.info(f"WGS84 границы: left={left}, bottom={bottom}, right={right}, top={top}")
+            
+            # Преобразуем WGS84 границы в CRS изображения
+            try:
+                bounds_src = transform_bounds("EPSG:4326", crs, left, bottom, right, top)
+                app_logger.info(f"Границы в CRS изображения: {bounds_src}")
+            except Exception as e:
+                app_logger.error(f"Ошибка преобразования границ: {e}")
+                return None
+            
+            # Получаем окно в пикселях
+            window = src.window(*bounds_src)
+            window = window.round_lengths().round_offsets()
+            window = window.intersection(Window(0, 0, src.width, src.height))
+            
+            app_logger.info(f"Окно: {window}")
+            
+            if window.width == 0 or window.height == 0:
+                app_logger.warning("Окно за пределами изображения")
+                return None
+            
+            # Читаем данные
+            if src.count == 1:
+                data = src.read(1, window=window).astype(np.float32)
+                app_logger.info(f"Прочитан 1 канал, форма={data.shape}")
+            else:
+                # Для многоканальных изображений используем среднее
+                bands_to_read = min(3, src.count)
+                data = src.read(list(range(1, bands_to_read + 1)), window=window).astype(np.float32)
+                data = np.mean(data, axis=0)
+                app_logger.info(f"Прочитано {bands_to_read} каналов, после среднего форма={data.shape}")
+            
+            # Обрабатываем nodata значения
+            if src.nodata is not None:
+                data = np.where(data == src.nodata, np.nan, data)
+            
+            # Заменяем NaN на 0
+            data = np.nan_to_num(data, nan=0.0)
+            
+            # Нормализуем данные в диапазон 0-255
+            dmin, dmax = data.min(), data.max()
+            app_logger.info(f"Диапазон данных: min={dmin}, max={dmax}")
+            
+            if dmax - dmin > 1e-6:
+                data = ((data - dmin) / (dmax - dmin) * 255).astype(np.uint8)
+            else:
+                data = np.zeros_like(data, dtype=np.uint8)
+            
+            # Изменяем размер до целевого
+            if data.shape[0] != target_size[1] or data.shape[1] != target_size[0]:
+                img = Image.fromarray(data)
+                img = img.resize(target_size, Image.Resampling.BILINEAR)
+                data = np.array(img)
+                app_logger.info(f"Изменен размер на {data.shape}")
+            
+            return data
+            
+    except Exception as e:
+        app_logger.error(f"Ошибка в extract_image_from_bbox: {e}", exc_info=True)
+        return None
+
 
 @app.post("/api/compare-area")
 async def compare_area(request: dict):
-    date1 = request.get("date1")
-    layer1 = request.get("layer1")
-    date2 = request.get("date2")
-    layer2 = request.get("layer2")
-    bbox = request.get("bbox")
-    if not all([date1, layer1, date2, layer2, bbox]) or len(bbox) != 4:
-        raise HTTPException(status_code=400, detail="Missing parameters or invalid bbox")
-    
-    img_info1 = database.get_image_info_by_layer_and_date(date1, layer1)
-    img_info2 = database.get_image_info_by_layer_and_date(date2, layer2)
-    if not img_info1 or not img_info2:
-        raise HTTPException(status_code=404, detail="Layer not found")
-    
-    filepath1 = os.path.join(IMAGES_DIR, img_info1["filename"])
-    filepath2 = os.path.join(IMAGES_DIR, img_info2["filename"])
-    
     try:
-        target_size = COMPARE_AREA_SIZE
+        date1 = request.get("date1")
+        layer1 = request.get("layer1")
+        date2 = request.get("date2")
+        layer2 = request.get("layer2")
+        bbox = request.get("bbox")
+        
+        app_logger.info(f"=== СРАВНЕНИЕ ОБЛАСТЕЙ ===")
+        app_logger.info(f"date1={date1}, layer1={layer1}")
+        app_logger.info(f"date2={date2}, layer2={layer2}")
+        app_logger.info(f"bbox={bbox}")
+        
+        if not all([date1, layer1, date2, layer2, bbox]) or len(bbox) != 4:
+            raise HTTPException(status_code=400, detail="Missing parameters or invalid bbox")
+        
+        # Получаем информацию об изображениях
+        img_info1 = database.get_image_info_by_layer_and_date(date1, layer1)
+        img_info2 = database.get_image_info_by_layer_and_date(date2, layer2)
+        
+        app_logger.info(f"img_info1: {img_info1}")
+        app_logger.info(f"img_info2: {img_info2}")
+        
+        if not img_info1 or not img_info2:
+            raise HTTPException(status_code=404, detail="Layer not found")
+        
+        filepath1 = os.path.join(IMAGES_DIR, img_info1["filename"])
+        filepath2 = os.path.join(IMAGES_DIR, img_info2["filename"])
+        
+        app_logger.info(f"filepath1: {filepath1}")
+        app_logger.info(f"filepath2: {filepath2}")
+        
+        # Проверяем существование файлов
+        if not os.path.exists(filepath1):
+            raise HTTPException(status_code=404, detail=f"File not found: {filepath1}")
+        if not os.path.exists(filepath2):
+            raise HTTPException(status_code=404, detail=f"File not found: {filepath2}")
+        
+        target_size = COMPARE_AREA_SIZE  # (256, 256)
+        
+        # Извлекаем данные для выбранной области
         data1 = extract_image_from_bbox(filepath1, bbox, target_size)
         data2 = extract_image_from_bbox(filepath2, bbox, target_size)
+        
+        app_logger.info(f"data1 is None: {data1 is None}")
+        app_logger.info(f"data2 is None: {data2 is None}")
+        
         if data1 is None or data2 is None:
             raise HTTPException(status_code=400, detail="Selected area is outside the image bounds")
         
+        # Вычисляем разницу
         diff = np.abs(data1.astype(np.float32) - data2.astype(np.float32))
+        
+        # Статистика разницы
         diff_min = float(np.min(diff))
         diff_max = float(np.max(diff))
         diff_mean = float(np.mean(diff))
         diff_std = float(np.std(diff))
         hist, _ = np.histogram(diff, bins=50, range=(0, 255))
         
+        # Статистика для первого изображения
+        stats1_min = float(np.min(data1))
+        stats1_max = float(np.max(data1))
+        stats1_mean = float(np.mean(data1))
+        stats1_std = float(np.std(data1))
+        
+        # Статистика для второго изображения
+        stats2_min = float(np.min(data2))
+        stats2_max = float(np.max(data2))
+        stats2_mean = float(np.mean(data2))
+        stats2_std = float(np.std(data2))
+        
+        # Изменения
+        mean_change = stats2_mean - stats1_mean
+        mean_change_percent = (mean_change / stats1_mean * 100) if stats1_mean != 0 else 0
+        
+        # Создаем изображение разницы
         diff_img = Image.fromarray(diff.astype(np.uint8), mode='L').convert('RGB')
         img_bytes = io.BytesIO()
         diff_img.save(img_bytes, format='PNG')
         img_bytes.seek(0)
         img_base64 = base64.b64encode(img_bytes.getvalue()).decode('utf-8')
         
-        return {
+        # Создаем изображения для каждого слоя
+        img1 = Image.fromarray(data1, mode='L')
+        img1_bytes = io.BytesIO()
+        img1.save(img1_bytes, format='PNG')
+        img1_base64 = base64.b64encode(img1_bytes.getvalue()).decode('utf-8')
+        
+        img2 = Image.fromarray(data2, mode='L')
+        img2_bytes = io.BytesIO()
+        img2.save(img2_bytes, format='PNG')
+        img2_base64 = base64.b64encode(img2_bytes.getvalue()).decode('utf-8')
+        
+        response_data = {
             "statistics": {
                 "min": diff_min,
                 "max": diff_max,
@@ -500,8 +618,34 @@ async def compare_area(request: dict):
                 "stddev": diff_std,
                 "histogram": hist.tolist()
             },
-            "image": f"data:image/png;base64,{img_base64}"
+            "layer1_stats": {
+                "min": stats1_min,
+                "max": stats1_max,
+                "mean": stats1_mean,
+                "stddev": stats1_std
+            },
+            "layer2_stats": {
+                "min": stats2_min,
+                "max": stats2_max,
+                "mean": stats2_mean,
+                "stddev": stats2_std
+            },
+            "changes": {
+                "mean_change": mean_change,
+                "mean_change_percent": mean_change_percent
+            },
+            "images": {
+                "diff": f"data:image/png;base64,{img_base64}",
+                "layer1": f"data:image/png;base64,{img1_base64}",
+                "layer2": f"data:image/png;base64,{img2_base64}"
+            }
         }
+        
+        app_logger.info("Ответ успешно сформирован")
+        return response_data
+        
+    except HTTPException:
+        raise
     except Exception as e:
         app_logger.error(f"Ошибка сравнения областей: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
